@@ -87,7 +87,9 @@ pub fn match_symbols(old_symbols: &[Symbol], new_symbols: &[Symbol]) -> MatchRes
             let name_sim = old_sym.name_similarity(new_sym);
             // Early skip: if name_sim contributes max 0.4, body needs > ~0.17 for score > 0.5
             let body_threshold = (0.5 - name_sim * 0.4).max(0.0) / 0.6;
-            let body_sim = old_sym.body_similarity_threshold(new_sym, body_threshold);
+            // Use AST structural similarity when fingerprints are available (O(n+m)),
+            // falls back to text-based Levenshtein when not available
+            let body_sim = old_sym.structural_similarity_threshold(new_sym, body_threshold);
             // Weighted combination: name matters more for same-file matching
             let score = name_sim * 0.4 + body_sim * 0.6;
             if score > 0.5 {

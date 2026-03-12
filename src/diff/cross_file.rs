@@ -97,7 +97,7 @@ pub fn detect_cross_file_moves(
                 if old_sym.file_path == unmatched_new[ni].file_path {
                     continue;
                 }
-                let sim = old_sym.body_similarity_threshold(&unmatched_new[ni], 0.5);
+                let sim = old_sym.structural_similarity_threshold(&unmatched_new[ni], 0.5);
                 if sim > 0.5 {
                     if best.is_none() || sim > best.unwrap().1 {
                         best = Some((ni, sim));
@@ -146,7 +146,7 @@ pub fn detect_cross_file_moves(
                         if old_sym.file_path == new_sym.file_path {
                             continue;
                         }
-                        let body_sim = old_sym.body_similarity_threshold(new_sym, 0.7);
+                        let body_sim = old_sym.structural_similarity_threshold(new_sym, 0.7);
                         if body_sim > 0.7 {
                             matches.push(CrossFileMatch {
                                 old_idx: oi,

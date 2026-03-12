@@ -82,6 +82,11 @@ pub struct Symbol {
     pub visibility: Visibility,
     pub parameters: Vec<Parameter>,
     pub return_type: Option<String>,
+    /// AST Structure Fingerprint: sorted set of shingle hashes derived from
+    /// the DFS traversal of the symbol's AST subtree. Used for O(n+m)
+    /// structural similarity comparison instead of O(n*m) Levenshtein.
+    #[serde(default)]
+    pub ast_fingerprint: Vec<u64>,
 }
 
 impl Symbol {
@@ -140,6 +145,47 @@ impl Symbol {
         }
         let distance = levenshtein_bounded(&self.name, &other.name, max_len);
         1.0 - (distance as f64 / max_len as f64)
+    }
+
+    /// Compute structural similarity using AST fingerprints (0.0 - 1.0).
+    /// Uses Jaccard similarity on sorted shingle sets: O(|A| + |B|).
+    ///
+    /// This is a novel approach: instead of comparing text (Levenshtein O(n*m)),
+    /// we compare the *structure* of the AST. This means:
+    /// - Variable renames don't affect similarity
+    /// - Formatting/whitespace changes are invisible
+    /// - Only structural changes (added/removed statements, changed control flow) matter
+    ///
+    /// Falls back to text-based comparison if fingerprints are not available.
+    pub fn structural_similarity(&self, other: &Symbol) -> f64 {
+        if self.body_hash == other.body_hash {
+            return 1.0;
+        }
+        if self.ast_fingerprint.is_empty() || other.ast_fingerprint.is_empty() {
+            // Fallback to text-based
+            return self.body_similarity_threshold(other, 0.0);
+        }
+        sorted_jaccard(&self.ast_fingerprint, &other.ast_fingerprint)
+    }
+
+    /// Compute structural similarity with early exit if it can't exceed threshold.
+    pub fn structural_similarity_threshold(&self, other: &Symbol, threshold: f64) -> f64 {
+        if self.body_hash == other.body_hash {
+            return 1.0;
+        }
+        if self.ast_fingerprint.is_empty() || other.ast_fingerprint.is_empty() {
+            return self.body_similarity_threshold(other, threshold);
+        }
+
+        // Upper bound: |A∩B| / |A∪B| ≤ min(|A|,|B|) / max(|A|,|B|)
+        let a_len = self.ast_fingerprint.len();
+        let b_len = other.ast_fingerprint.len();
+        let upper = a_len.min(b_len) as f64 / a_len.max(b_len).max(1) as f64;
+        if upper < threshold {
+            return 0.0;
+        }
+
+        sorted_jaccard(&self.ast_fingerprint, &other.ast_fingerprint)
     }
 
     /// Check if signatures differ (ignoring names)
@@ -219,6 +265,97 @@ fn levenshtein_bounded(a: &str, b: &str, max_dist: usize) -> usize {
     }
 
     prev[n]
+}
+
+/// Jaccard similarity on two sorted u64 slices. O(|A| + |B|).
+fn sorted_jaccard(a: &[u64], b: &[u64]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let mut i = 0;
+    let mut j = 0;
+    let mut intersection = 0u64;
+    let mut union = 0u64;
+    while i < a.len() && j < b.len() {
+        if a[i] == b[j] {
+            intersection += 1;
+            union += 1;
+            i += 1;
+            j += 1;
+        } else if a[i] < b[j] {
+            union += 1;
+            i += 1;
+        } else {
+            union += 1;
+            j += 1;
+        }
+    }
+    union += (a.len() - i + b.len() - j) as u64;
+    if union == 0 {
+        return 1.0;
+    }
+    intersection as f64 / union as f64
+}
+
+/// Compute an AST structure fingerprint from a tree-sitter Node.
+///
+/// Algorithm:
+/// 1. DFS traversal of the AST subtree, collecting (node_kind_id, depth) pairs
+/// 2. Generate k-shingles (k=3) over the traversal sequence
+/// 3. Hash each shingle to u64
+/// 4. Return sorted, deduplicated set of shingle hashes
+///
+/// Key insight: identifiers/literals are replaced with their node *type*,
+/// so `x + y` and `a + b` produce identical fingerprints. Only structural
+/// changes (different operators, control flow, added statements) differ.
+pub fn compute_ast_fingerprint(node: tree_sitter::Node, source: &[u8]) -> Vec<u64> {
+    let mut trail: Vec<u16> = Vec::new();
+    collect_ast_trail(node, source, 0, &mut trail);
+
+    if trail.len() < 3 {
+        return Vec::new();
+    }
+
+    // Generate 3-shingles and hash them
+    let mut shingles: Vec<u64> = Vec::with_capacity(trail.len() - 2);
+    for window in trail.windows(3) {
+        // FNV-1a inspired hash for 3 u16 values
+        let mut h: u64 = 14695981039346656037;
+        for &v in window {
+            h ^= v as u64;
+            h = h.wrapping_mul(1099511628211);
+        }
+        shingles.push(h);
+    }
+
+    shingles.sort_unstable();
+    shingles.dedup();
+    shingles
+}
+
+/// DFS traversal collecting encoded node types.
+/// Named nodes get their kind_id. Anonymous tokens (operators, punctuation)
+/// get a special encoding. Identifiers and literals are collapsed to their
+/// type (so variable renames don't affect the fingerprint).
+fn collect_ast_trail(node: tree_sitter::Node, source: &[u8], depth: u16, trail: &mut Vec<u16>) {
+    // Encode: kind_id in lower 10 bits, depth in upper 6 bits (capped at 63)
+    let kind_id = node.kind_id();
+    let d = depth.min(63);
+    let encoded = (d << 10) | (kind_id & 0x3FF);
+    trail.push(encoded);
+
+    let cursor = &mut node.walk();
+    if cursor.goto_first_child() {
+        loop {
+            collect_ast_trail(cursor.node(), source, depth + 1, trail);
+            if !cursor.goto_next_sibling() {
+                break;
+            }
+        }
+    }
 }
 
 /// Normalize source body for comparison

@@ -2,7 +2,7 @@ use std::path::Path;
 use tree_sitter::{Node, Tree};
 
 use super::language::Language;
-use super::symbol::{normalize_body, Parameter, Symbol, SymbolKind, Visibility};
+use super::symbol::{compute_ast_fingerprint, normalize_body, Parameter, Symbol, SymbolKind, Visibility};
 
 /// Extract all symbols from a parsed tree
 pub fn extract_symbols(tree: &Tree, source: &[u8], path: &Path, language: Language) -> Vec<Symbol> {
@@ -161,6 +161,7 @@ fn extract_rust_function(
         visibility,
         parameters,
         return_type,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -191,6 +192,7 @@ fn extract_rust_type_def(
         visibility,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -227,6 +229,7 @@ fn extract_rust_const(
         visibility,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -350,6 +353,7 @@ fn extract_go_node(
                                 visibility: Visibility::Unknown,
                                 parameters: Vec::new(),
                                 return_type: None,
+                                ast_fingerprint: compute_ast_fingerprint(child, source),
                             });
                         }
                     }
@@ -398,6 +402,7 @@ fn extract_go_function(node: Node, source: &[u8], path: &Path) -> Option<Symbol>
         visibility,
         parameters,
         return_type,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -458,6 +463,7 @@ fn extract_go_method(node: Node, source: &[u8], path: &Path) -> Option<Symbol> {
         visibility,
         parameters,
         return_type,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -499,6 +505,7 @@ fn extract_go_type_spec(node: Node, source: &[u8], path: &Path) -> Option<Symbol
         visibility,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -661,6 +668,7 @@ fn extract_ts_function(
         visibility,
         parameters,
         return_type,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -732,6 +740,7 @@ fn extract_ts_lexical(
             visibility,
             parameters,
             return_type,
+            ast_fingerprint: compute_ast_fingerprint(node, source),
         });
     }
 }
@@ -758,6 +767,7 @@ fn extract_ts_class(node: Node, source: &[u8], path: &Path) -> Option<Symbol> {
         visibility,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -794,6 +804,7 @@ fn extract_ts_method(
         visibility: Visibility::Public,
         parameters,
         return_type,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -830,6 +841,7 @@ fn extract_ts_type_decl(
         visibility,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -926,6 +938,7 @@ fn extract_ts_export_default(node: Node, source: &[u8], path: &Path) -> Option<S
         visibility: Visibility::Public,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -1044,6 +1057,7 @@ fn extract_python_function(
         visibility,
         parameters,
         return_type,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 
@@ -1068,6 +1082,7 @@ fn extract_python_class(node: Node, source: &[u8], path: &Path) -> Option<Symbol
         visibility: Visibility::Public,
         parameters: Vec::new(),
         return_type: None,
+        ast_fingerprint: compute_ast_fingerprint(node, source),
     })
 }
 

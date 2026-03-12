@@ -17,24 +17,10 @@ use crate::tui::app::App;
 struct BlockRegion {
     start_line: usize, // 1-based inclusive
     end_line: usize,   // 1-based inclusive
-    color_idx: usize,  // index into BLOCK_COLORS palette
-    #[allow(dead_code)]
-    kind: BlockKind,
+    color_idx: usize,
     is_selected: bool,
-    /// Line numbers (1-based) within this region that are changed (added/deleted)
     changed_lines: HashSet<usize>,
-    /// Label for the block (e.g. "~ modified", "fn foo ⟶ async-utils.ts")
     label: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum BlockKind {
-    Moved,
-    Added,
-    Deleted,
-    Modified,
-    Extracted,
-    Inlined,
 }
 
 /// Palette of distinct border/accent colors for blocks
@@ -60,27 +46,19 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
     let old_file = change.old_symbol.as_ref().map(|s| s.file_path.clone());
     let new_file = change.new_symbol.as_ref().map(|s| s.file_path.clone());
 
-    // File path header
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(1),
-    ])
-    .split(area);
-
-    let header_halves = Layout::horizontal([
-        Constraint::Percentage(50),
-        Constraint::Percentage(50),
-    ])
-    .split(chunks[0]);
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+    let header_halves =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[0]);
 
     let old_path_str = old_file
         .as_ref()
-        .map(|p| format!(" ← {}", p.display()))
-        .unwrap_or_else(|| " ← (none)".to_string());
+        .map(|p| format!(" <- {}", p.display()))
+        .unwrap_or_else(|| " <- (none)".to_string());
     let new_path_str = new_file
         .as_ref()
-        .map(|p| format!(" → {}", p.display()))
-        .unwrap_or_else(|| " → (none)".to_string());
+        .map(|p| format!(" -> {}", p.display()))
+        .unwrap_or_else(|| " -> (none)".to_string());
 
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -92,16 +70,44 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             new_path_str,
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
         ))),
         header_halves[1],
     );
 
-    let panels = Layout::horizontal([
-        Constraint::Percentage(50),
-        Constraint::Percentage(50),
-    ])
-    .split(chunks[1]);
+    let panels =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[1]);
+
+    // Load file content (requires &mut app) before borrowing changes
+    let old_content = old_file
+        .as_ref()
+        .and_then(|p| app.load_old_file_content(p))
+        .map(|s| s.to_string());
+    let new_content = new_file
+        .as_ref()
+        .and_then(|p| app.load_file_content(p))
+        .map(|s| s.to_string());
+
+    let old_fallback = if old_content.is_none() {
+        app.selected_change()
+            .and_then(|c| c.old_symbol.as_ref())
+            .map(|s| s.body_text.clone())
+    } else {
+        None
+    };
+    let new_fallback = if new_content.is_none() {
+        app.selected_change()
+            .and_then(|c| c.new_symbol.as_ref())
+            .map(|s| s.body_text.clone())
+    } else {
+        None
+    };
+
+    let old_display = old_content.as_deref().or(old_fallback.as_deref());
+    let new_display = new_content.as_deref().or(new_fallback.as_deref());
 
     let all_changes: Vec<&SemanticChange> = app.diff_result.changes.iter().collect();
     let selected_idx = app.selected_index;
@@ -112,45 +118,313 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
         selected_idx,
     );
 
-    let old_content = old_file
-        .as_ref()
-        .and_then(|p| app.load_old_file_content(p))
-        .map(|s| s.to_string());
-    let new_content = new_file
-        .as_ref()
-        .and_then(|p| app.load_file_content(p))
-        .map(|s| s.to_string());
-
-    let old_fallback;
-    let new_fallback;
-    let old_display = if old_content.is_some() {
-        old_content.as_deref()
-    } else {
-        old_fallback = app
-            .selected_change()
-            .and_then(|c| c.old_symbol.as_ref())
-            .map(|s| s.body_text.clone());
-        old_fallback.as_deref()
-    };
-    let new_display = if new_content.is_some() {
-        new_content.as_deref()
-    } else {
-        new_fallback = app
-            .selected_change()
-            .and_then(|c| c.new_symbol.as_ref())
-            .map(|s| s.body_text.clone());
-        new_fallback.as_deref()
-    };
-
-    // scroll = file line number (0-based) to start from
     let scroll = app.detail_scroll;
+    let h_scroll = app.detail_h_scroll;
     let panel_width = panels[0].width as usize;
+    let visible_height = panels[0].height as usize;
+    let border_width = panel_width.saturating_sub(1);
 
-    render_file_panel(f, panels[0], old_display, &old_regions, scroll, panel_width);
-    render_file_panel(f, panels[1], new_display, &new_regions, scroll, panel_width);
+    let old_text = old_display.unwrap_or("");
+    let new_text = new_display.unwrap_or("");
+
+    // Phase 1: Build aligned rows using file-level diff
+    let aligned_rows = build_aligned_rows(old_text, new_text);
+
+    // Phase 2: Render rows with block overlays and insert borders
+    let (old_vlines, new_vlines) = render_aligned_rows(
+        &aligned_rows,
+        old_text,
+        new_text,
+        &old_regions,
+        &new_regions,
+        border_width,
+        h_scroll,
+    );
+
+    // Phase 3: Scroll and display
+    let scroll_vline = find_scroll_vline(&old_vlines, scroll);
+
+    let mut old_visible: Vec<Line> = Vec::with_capacity(visible_height);
+    let mut new_visible: Vec<Line> = Vec::with_capacity(visible_height);
+
+    for i in scroll_vline..(scroll_vline + visible_height) {
+        old_visible.push(
+            old_vlines
+                .get(i)
+                .cloned()
+                .unwrap_or_else(tilde_line),
+        );
+        new_visible.push(
+            new_vlines
+                .get(i)
+                .cloned()
+                .unwrap_or_else(tilde_line),
+        );
+    }
+
+    f.render_widget(Paragraph::new(old_visible), panels[0]);
+    f.render_widget(Paragraph::new(new_visible), panels[1]);
+}
+
+fn tilde_line<'a>() -> Line<'a> {
+    Line::from(Span::styled("~", Style::default().fg(Color::DarkGray)))
+}
+
+// === Phase 1: Build aligned rows from file-level diff ===
+
+/// An aligned row: what to show on old side and new side
+#[derive(Debug, Clone)]
+enum AlignedRow {
+    /// Both sides show a line (equal in file diff)
+    Both { old_line: usize, new_line: usize },
+    /// Only old side (deleted line)
+    OldOnly { old_line: usize },
+    /// Only new side (inserted line)
+    NewOnly { new_line: usize },
+}
+
+fn build_aligned_rows(old_text: &str, new_text: &str) -> Vec<AlignedRow> {
+    use similar::{ChangeTag, TextDiff};
+
+    let file_diff = TextDiff::from_lines(old_text, new_text);
+    let mut rows = Vec::new();
+    let mut old_line: usize = 0;
+    let mut new_line: usize = 0;
+
+    for change in file_diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                old_line += 1;
+                new_line += 1;
+                rows.push(AlignedRow::Both { old_line, new_line });
+            }
+            ChangeTag::Delete => {
+                old_line += 1;
+                rows.push(AlignedRow::OldOnly { old_line });
+            }
+            ChangeTag::Insert => {
+                new_line += 1;
+                rows.push(AlignedRow::NewOnly { new_line });
+            }
+        }
+    }
+    rows
+}
+
+// === Phase 2: Render aligned rows with block borders ===
+
+fn render_aligned_rows<'a>(
+    rows: &[AlignedRow],
+    old_text: &str,
+    new_text: &str,
+    old_regions: &[BlockRegion],
+    new_regions: &[BlockRegion],
+    border_width: usize,
+    h_scroll: usize,
+) -> (Vec<Line<'a>>, Vec<Line<'a>>) {
+    let old_file_lines: Vec<&str> = old_text.lines().collect();
+    let new_file_lines: Vec<&str> = new_text.lines().collect();
+
+    let old_region_map = build_region_map(old_regions);
+    let new_region_map = build_region_map(new_regions);
+
+    let mut old_result: Vec<Line<'a>> = Vec::new();
+    let mut new_result: Vec<Line<'a>> = Vec::new();
+
+    // Track which blocks have had their top/bottom border emitted
+    let mut old_top_emitted: HashSet<usize> = HashSet::new();
+    let mut old_bottom_emitted: HashSet<usize> = HashSet::new();
+    let mut new_top_emitted: HashSet<usize> = HashSet::new();
+    let mut new_bottom_emitted: HashSet<usize> = HashSet::new();
+
+    for row in rows {
+        let (old_ln, new_ln) = match row {
+            AlignedRow::Both { old_line, new_line } => (Some(*old_line), Some(*new_line)),
+            AlignedRow::OldOnly { old_line } => (Some(*old_line), None),
+            AlignedRow::NewOnly { new_line } => (None, Some(*new_line)),
+        };
+
+        // Emit top borders if this line starts a block
+        let old_needs_top = old_ln.and_then(|ln| {
+            old_region_map.get(&ln).and_then(|&ri| {
+                if old_regions[ri].start_line == ln && !old_top_emitted.contains(&ri) {
+                    Some(ri)
+                } else {
+                    None
+                }
+            })
+        });
+        let new_needs_top = new_ln.and_then(|ln| {
+            new_region_map.get(&ln).and_then(|&ri| {
+                if new_regions[ri].start_line == ln && !new_top_emitted.contains(&ri) {
+                    Some(ri)
+                } else {
+                    None
+                }
+            })
+        });
+
+        // Emit top borders
+        match (old_needs_top, new_needs_top) {
+            (Some(ori), Some(nri)) => {
+                let or = &old_regions[ori];
+                let nr = &new_regions[nri];
+                old_result.push(render_border_top(
+                    BLOCK_COLORS[or.color_idx], &or.label, border_width, or.is_selected,
+                ));
+                new_result.push(render_border_top(
+                    BLOCK_COLORS[nr.color_idx], &nr.label, border_width, nr.is_selected,
+                ));
+                old_top_emitted.insert(ori);
+                new_top_emitted.insert(nri);
+            }
+            (Some(ori), None) => {
+                let or = &old_regions[ori];
+                old_result.push(render_border_top(
+                    BLOCK_COLORS[or.color_idx], &or.label, border_width, or.is_selected,
+                ));
+                new_result.push(padding_line());
+                old_top_emitted.insert(ori);
+            }
+            (None, Some(nri)) => {
+                let nr = &new_regions[nri];
+                old_result.push(padding_line());
+                new_result.push(render_border_top(
+                    BLOCK_COLORS[nr.color_idx], &nr.label, border_width, nr.is_selected,
+                ));
+                new_top_emitted.insert(nri);
+            }
+            (None, None) => {}
+        }
+
+        // Emit content
+        match row {
+            AlignedRow::Both { old_line, new_line } => {
+                let old_info = get_region_info(old_regions, &old_region_map, *old_line);
+                let new_info = get_region_info(new_regions, &new_region_map, *new_line);
+                let ot = old_file_lines.get(*old_line - 1).copied().unwrap_or("");
+                let nt = new_file_lines.get(*new_line - 1).copied().unwrap_or("");
+                old_result.push(render_content_line(*old_line, ot, old_info, h_scroll));
+                new_result.push(render_content_line(*new_line, nt, new_info, h_scroll));
+            }
+            AlignedRow::OldOnly { old_line } => {
+                let old_info = get_region_info_as_changed(old_regions, &old_region_map, *old_line);
+                let ot = old_file_lines.get(*old_line - 1).copied().unwrap_or("");
+                old_result.push(render_content_line(*old_line, ot, old_info, h_scroll));
+                new_result.push(padding_line());
+            }
+            AlignedRow::NewOnly { new_line } => {
+                let new_info = get_region_info_as_changed(new_regions, &new_region_map, *new_line);
+                let nt = new_file_lines.get(*new_line - 1).copied().unwrap_or("");
+                old_result.push(padding_line());
+                new_result.push(render_content_line(*new_line, nt, new_info, h_scroll));
+            }
+        }
+
+        // Emit bottom borders if this line ends a block
+        let old_needs_bottom = old_ln.and_then(|ln| {
+            old_region_map.get(&ln).and_then(|&ri| {
+                if old_regions[ri].end_line == ln && !old_bottom_emitted.contains(&ri) {
+                    Some(ri)
+                } else {
+                    None
+                }
+            })
+        });
+        let new_needs_bottom = new_ln.and_then(|ln| {
+            new_region_map.get(&ln).and_then(|&ri| {
+                if new_regions[ri].end_line == ln && !new_bottom_emitted.contains(&ri) {
+                    Some(ri)
+                } else {
+                    None
+                }
+            })
+        });
+
+        match (old_needs_bottom, new_needs_bottom) {
+            (Some(ori), Some(nri)) => {
+                let or = &old_regions[ori];
+                let nr = &new_regions[nri];
+                old_result.push(render_border_bottom(
+                    BLOCK_COLORS[or.color_idx], border_width, or.is_selected,
+                ));
+                new_result.push(render_border_bottom(
+                    BLOCK_COLORS[nr.color_idx], border_width, nr.is_selected,
+                ));
+                old_bottom_emitted.insert(ori);
+                new_bottom_emitted.insert(nri);
+            }
+            (Some(ori), None) => {
+                let or = &old_regions[ori];
+                old_result.push(render_border_bottom(
+                    BLOCK_COLORS[or.color_idx], border_width, or.is_selected,
+                ));
+                new_result.push(padding_line());
+                old_bottom_emitted.insert(ori);
+            }
+            (None, Some(nri)) => {
+                let nr = &new_regions[nri];
+                old_result.push(padding_line());
+                new_result.push(render_border_bottom(
+                    BLOCK_COLORS[nr.color_idx], border_width, nr.is_selected,
+                ));
+                new_bottom_emitted.insert(nri);
+            }
+            (None, None) => {}
+        }
+    }
+
+    (old_result, new_result)
 }
 
 // === Block region building ===
+
+/// Map from 1-based line number to region index
+fn build_region_map(regions: &[BlockRegion]) -> std::collections::HashMap<usize, usize> {
+    let mut map = std::collections::HashMap::new();
+    for (ri, r) in regions.iter().enumerate() {
+        for line in r.start_line..=r.end_line {
+            // Only store the first region for a line (in case of overlap)
+            map.entry(line).or_insert(ri);
+        }
+    }
+    map
+}
+
+fn get_region_info(
+    regions: &[BlockRegion],
+    region_map: &std::collections::HashMap<usize, usize>,
+    line_num: usize,
+) -> Option<ContentRegionInfo> {
+    if let Some(&ri) = region_map.get(&line_num) {
+        let r = &regions[ri];
+        Some(ContentRegionInfo {
+            color: BLOCK_COLORS[r.color_idx],
+            is_changed: r.changed_lines.contains(&line_num),
+            is_selected: r.is_selected,
+        })
+    } else {
+        None
+    }
+}
+
+/// Like get_region_info but forces is_changed=true (for diff Delete/Insert lines)
+fn get_region_info_as_changed(
+    regions: &[BlockRegion],
+    region_map: &std::collections::HashMap<usize, usize>,
+    line_num: usize,
+) -> Option<ContentRegionInfo> {
+    if let Some(&ri) = region_map.get(&line_num) {
+        let r = &regions[ri];
+        Some(ContentRegionInfo {
+            color: BLOCK_COLORS[r.color_idx],
+            is_changed: true,
+            is_selected: r.is_selected,
+        })
+    } else {
+        None
+    }
+}
 
 fn build_block_regions(
     changes: &[&SemanticChange],
@@ -163,8 +437,6 @@ fn build_block_regions(
     let mut color_counter = 0usize;
 
     for (idx, change) in changes.iter().enumerate() {
-        let kind = classify_block_kind(&change.kind);
-
         let touches_old = change
             .old_symbol
             .as_ref()
@@ -182,6 +454,7 @@ fn build_block_regions(
         let is_selected = idx == selected_idx;
         let (old_changed, new_changed) = compute_changed_lines(change);
 
+        let kind = classify_block_kind(&change.kind);
         let old_label = build_label(change, kind, true);
         let new_label = build_label(change, kind, false);
 
@@ -191,7 +464,6 @@ fn build_block_regions(
                     start_line: sym.line_range.0,
                     end_line: sym.line_range.1,
                     color_idx,
-                    kind,
                     is_selected,
                     changed_lines: old_changed,
                     label: old_label,
@@ -205,7 +477,6 @@ fn build_block_regions(
                     start_line: sym.line_range.0,
                     end_line: sym.line_range.1,
                     color_idx,
-                    kind,
                     is_selected,
                     changed_lines: new_changed,
                     label: new_label,
@@ -221,6 +492,29 @@ fn build_block_regions(
     (old_regions, new_regions)
 }
 
+// === Labels and classification ===
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum BlockKind {
+    Moved,
+    Added,
+    Deleted,
+    Modified,
+    Extracted,
+    Inlined,
+}
+
+fn classify_block_kind(kind: &ChangeKind) -> BlockKind {
+    match kind {
+        ChangeKind::Added => BlockKind::Added,
+        ChangeKind::Deleted => BlockKind::Deleted,
+        ChangeKind::Moved { .. } | ChangeKind::MovedAndModified { .. } => BlockKind::Moved,
+        ChangeKind::Extracted { .. } => BlockKind::Extracted,
+        ChangeKind::Inlined { .. } => BlockKind::Inlined,
+        _ => BlockKind::Modified,
+    }
+}
+
 fn build_label(change: &SemanticChange, kind: BlockKind, is_old: bool) -> String {
     let name = change.symbol_name();
     match kind {
@@ -231,29 +525,23 @@ fn build_label(change: &SemanticChange, kind: BlockKind, is_old: bool) -> String
                     .as_ref()
                     .map(|s| s.file_path.display().to_string())
                     .unwrap_or_default();
-                format!("{} ⟶ {}", name, dest)
+                format!("{} -> {}", name, dest)
             } else {
                 let src = change
                     .old_symbol
                     .as_ref()
                     .map(|s| s.file_path.display().to_string())
                     .unwrap_or_default();
-                format!("{} ⟵ {}", name, src)
+                format!("{} <- {}", name, src)
             }
         }
         BlockKind::Extracted => {
-            if is_old {
-                format!("{} ⟶ extracted", name)
-            } else {
-                format!("{} ⟵ extracted", name)
-            }
+            if is_old { format!("{} -> extracted", name) }
+            else { format!("{} <- extracted", name) }
         }
         BlockKind::Inlined => {
-            if is_old {
-                format!("{} ⟶ inlined", name)
-            } else {
-                format!("{} ⟵ inlined", name)
-            }
+            if is_old { format!("{} -> inlined", name) }
+            else { format!("{} <- inlined", name) }
         }
         BlockKind::Added => format!("+ {}", name),
         BlockKind::Deleted => format!("- {}", name),
@@ -302,150 +590,30 @@ fn compute_changed_lines(change: &SemanticChange) -> (HashSet<usize>, HashSet<us
     (old_changed, new_changed)
 }
 
-fn classify_block_kind(kind: &ChangeKind) -> BlockKind {
-    match kind {
-        ChangeKind::Added => BlockKind::Added,
-        ChangeKind::Deleted => BlockKind::Deleted,
-        ChangeKind::Moved { .. } | ChangeKind::MovedAndModified { .. } => BlockKind::Moved,
-        ChangeKind::Extracted { .. } => BlockKind::Extracted,
-        ChangeKind::Inlined { .. } => BlockKind::Inlined,
-        _ => BlockKind::Modified,
-    }
-}
+// === Scroll ===
 
-// === Rendering ===
-
-/// Render one side of the side-by-side view with box-drawing borders around blocks.
-/// `scroll` is a 0-based file line index to start from.
-fn render_file_panel(
-    f: &mut Frame,
-    area: Rect,
-    content: Option<&str>,
-    regions: &[BlockRegion],
-    scroll: usize,
-    panel_width: usize,
-) {
-    let Some(content) = content else {
-        let p = Paragraph::new(Span::styled(
-            "(file not available)",
-            Style::default().fg(Color::DarkGray),
-        ));
-        f.render_widget(p, area);
-        return;
-    };
-
-    let file_lines: Vec<&str> = content.lines().collect();
-    let visible_height = area.height as usize;
-    let border_width = panel_width.saturating_sub(1); // width for ┌──┐ border lines
-
-    // Build all virtual lines (file lines + border lines), then take [scroll_virt..scroll_virt+visible_height]
-    let all_vlines = build_all_vlines(&file_lines, regions, border_width);
-
-    // Find the virtual line index corresponding to the scroll file line
-    let scroll_vline = file_line_to_vline(&all_vlines, scroll);
-
-    let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
-    for i in scroll_vline..(scroll_vline + visible_height) {
-        if i < all_vlines.len() {
-            lines.push(all_vlines[i].clone());
-        } else {
-            lines.push(Line::from(Span::styled("~", Style::default().fg(Color::DarkGray))));
-        }
-    }
-
-    let paragraph = Paragraph::new(lines);
-    f.render_widget(paragraph, area);
-}
-
-/// Build all virtual lines for the file, interleaving border lines with content.
-fn build_all_vlines<'a>(
-    file_lines: &[&str],
-    regions: &[BlockRegion],
-    border_width: usize,
-) -> Vec<Line<'a>> {
-    let mut result: Vec<Line<'a>> = Vec::new();
-    let mut region_idx = 0;
-    let mut active_region: Option<&BlockRegion> = None;
-
-    for file_idx in 0..file_lines.len() {
-        let line_num = file_idx + 1; // 1-based
-
-        // Check: should a new block start at this line?
-        if active_region.is_none() {
-            if region_idx < regions.len() && regions[region_idx].start_line == line_num {
-                let r = &regions[region_idx];
-                result.push(render_border_top(
-                    BLOCK_COLORS[r.color_idx],
-                    &r.label,
-                    border_width,
-                    r.is_selected,
-                ));
-                active_region = Some(r);
-                region_idx += 1;
-            }
-        }
-
-        // Render content line
-        let region_info = active_region.map(|r| ContentRegionInfo {
-            color: BLOCK_COLORS[r.color_idx],
-            is_changed: r.changed_lines.contains(&line_num),
-            is_selected: r.is_selected,
-        });
-        result.push(render_content_line(line_num, file_lines[file_idx], region_info));
-
-        // Check: should the active block end at this line?
-        if let Some(r) = active_region {
-            if line_num >= r.end_line {
-                result.push(render_border_bottom(
-                    BLOCK_COLORS[r.color_idx],
-                    border_width,
-                    r.is_selected,
-                ));
-                active_region = None;
-            }
-        }
-    }
-
-    result
-}
-
-/// Find the virtual line index for a given 0-based file line scroll position.
-/// Accounts for border lines inserted before/after blocks.
-fn file_line_to_vline(all_vlines: &[Line], file_line_scroll: usize) -> usize {
+fn find_scroll_vline(vlines: &[Line], file_line_scroll: usize) -> usize {
     if file_line_scroll == 0 {
         return 0;
     }
-    // Count how many content lines (not border lines) we've seen.
-    // A content line has line number prefix; border lines start with ┌ or └.
     let mut content_count = 0usize;
-    for (i, _line) in all_vlines.iter().enumerate() {
-        // Heuristic: border lines start with box-drawing chars, content lines start with │ or space
-        // Actually we can just count: every file line adds one Line, borders add extra.
-        // So virtual index = file_line_scroll + number_of_border_lines_before_it.
-        // Let's just walk and count.
-        if is_content_line(all_vlines, i) {
+    for (i, line) in vlines.iter().enumerate() {
+        if is_content_vline(line) {
             if content_count == file_line_scroll {
-                // Scroll to 2 lines before this to show the border too
                 return i.saturating_sub(1);
             }
             content_count += 1;
         }
     }
-    all_vlines.len().saturating_sub(1)
+    vlines.len().saturating_sub(1)
 }
 
-/// Check if a virtual line at index i is a content line (not a border line).
-/// Border lines are shorter or start with ┌/└.
-fn is_content_line(all_vlines: &[Line], idx: usize) -> bool {
-    if idx >= all_vlines.len() {
-        return false;
-    }
-    let line = &all_vlines[idx];
-    if line.spans.is_empty() {
-        return false;
-    }
-    let first_char = line.spans[0].content.chars().next().unwrap_or(' ');
-    first_char != '┌' && first_char != '└'
+fn is_content_vline(line: &Line) -> bool {
+    if line.spans.is_empty() { return false; }
+    let first = &line.spans[0].content;
+    if first.is_empty() { return false; }
+    let ch = first.chars().next().unwrap_or(' ');
+    ch != '┌' && ch != '└'
 }
 
 // === Line rendering ===
@@ -457,13 +625,16 @@ struct ContentRegionInfo {
     is_selected: bool,
 }
 
+fn padding_line<'a>() -> Line<'a> {
+    Line::from(Span::styled("", Style::default().bg(Color::Rgb(20, 20, 30))))
+}
+
 fn render_border_top<'a>(color: Color, label: &str, width: usize, is_selected: bool) -> Line<'a> {
     let style = if is_selected {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(color)
     };
-
     let prefix = "┌─ ";
     let suffix = " ─┐";
     let max_label = width.saturating_sub(prefix.len() + suffix.len() + 1);
@@ -472,7 +643,6 @@ fn render_border_top<'a>(color: Color, label: &str, width: usize, is_selected: b
         prefix.chars().count() + label_trimmed.chars().count() + suffix.chars().count(),
     );
     let fill: String = "─".repeat(fill_len);
-
     Line::from(vec![Span::styled(
         format!("{}{}{}{}", prefix, label_trimmed, fill, suffix),
         style,
@@ -485,7 +655,6 @@ fn render_border_bottom<'a>(color: Color, width: usize, is_selected: bool) -> Li
     } else {
         Style::default().fg(color)
     };
-
     let fill_len = width.saturating_sub(2);
     let fill: String = "─".repeat(fill_len);
     Line::from(vec![Span::styled(format!("└{}┘", fill), style)])
@@ -495,7 +664,10 @@ fn render_content_line<'a>(
     line_num: usize,
     text: &str,
     region_info: Option<ContentRegionInfo>,
+    h_scroll: usize,
 ) -> Line<'a> {
+    let expanded = expand_tabs(text);
+    let display_text: String = expanded.chars().skip(h_scroll).collect();
     let mut spans: Vec<Span<'a>> = Vec::new();
 
     if let Some(info) = region_info {
@@ -504,13 +676,11 @@ fn render_content_line<'a>(
         } else {
             Style::default().fg(info.color)
         };
-
         let num_style = if info.is_changed {
             Style::default().fg(info.color).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(darken_color(info.color, 50))
         };
-
         let text_style = if info.is_changed {
             Style::default()
                 .fg(Color::White)
@@ -522,17 +692,36 @@ fn render_content_line<'a>(
 
         spans.push(Span::styled("│", border_style));
         spans.push(Span::styled(format!("{:4} ", line_num), num_style));
-        spans.push(Span::styled(text.to_string(), text_style));
+        spans.push(Span::styled(display_text, text_style));
     } else {
         spans.push(Span::styled(" ", Style::default()));
         spans.push(Span::styled(
             format!("{:4} ", line_num),
             Style::default().fg(Color::DarkGray),
         ));
-        spans.push(Span::styled(text.to_string(), Style::default().fg(Color::Gray)));
+        spans.push(Span::styled(display_text, Style::default().fg(Color::Gray)));
     }
 
     Line::from(spans)
+}
+
+fn expand_tabs(text: &str) -> String {
+    if !text.contains('\t') {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    let mut col = 0;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let spaces = 4 - (col % 4);
+            for _ in 0..spaces { result.push(' '); }
+            col += spaces;
+        } else {
+            result.push(ch);
+            col += 1;
+        }
+    }
+    result
 }
 
 fn color_to_bg(color: Color) -> Color {

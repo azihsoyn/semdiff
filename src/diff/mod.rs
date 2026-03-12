@@ -5,6 +5,7 @@ pub mod cross_file;
 pub mod matcher;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -64,23 +65,25 @@ fn extract_all_symbols(
     files: &[PathBuf],
     root: &Path,
 ) -> Result<HashMap<PathBuf, Vec<Symbol>>> {
-    let mut result = HashMap::new();
-    for file in files {
-        match ast::extract_file_symbols(file) {
-            Ok(mut symbols) => {
-                let relpath = file.strip_prefix(root).unwrap_or(file).to_path_buf();
-                // Store relative path in symbols for cleaner display
-                for sym in &mut symbols {
-                    sym.file_path = relpath.clone();
+    let entries: Vec<_> = files
+        .par_iter()
+        .filter_map(|file| {
+            match ast::extract_file_symbols(file) {
+                Ok(mut symbols) => {
+                    let relpath = file.strip_prefix(root).unwrap_or(file).to_path_buf();
+                    for sym in &mut symbols {
+                        sym.file_path = relpath.clone();
+                    }
+                    Some((relpath, symbols))
                 }
-                result.insert(relpath, symbols);
+                Err(e) => {
+                    eprintln!("Warning: failed to parse {}: {}", file.display(), e);
+                    None
+                }
             }
-            Err(e) => {
-                eprintln!("Warning: failed to parse {}: {}", file.display(), e);
-            }
-        }
-    }
-    Ok(result)
+        })
+        .collect();
+    Ok(entries.into_iter().collect())
 }
 
 /// Run semantic diff between two git refs
@@ -126,30 +129,49 @@ pub fn semantic_diff_git(repo_dir: &Path, range: &GitRange) -> Result<DiffResult
     let mut old_files_list = Vec::new();
     let mut new_files_list = Vec::new();
 
-    for (path, content) in &old_contents {
-        match ast::extract_symbols_from_bytes(content, path) {
-            Ok(mut syms) => {
-                for sym in &mut syms {
-                    sym.file_path = path.clone();
+    let old_parsed: Vec<_> = old_contents
+        .par_iter()
+        .filter_map(|(path, content)| {
+            match ast::extract_symbols_from_bytes(content, path) {
+                Ok(mut syms) => {
+                    for sym in &mut syms {
+                        sym.file_path = path.clone();
+                    }
+                    Some((path.clone(), syms))
                 }
-                old_files_list.push(path.clone());
-                old_symbols.insert(path.clone(), syms);
+                Err(e) => {
+                    eprintln!("Warning: failed to parse old {}: {}", path.display(), e);
+                    None
+                }
             }
-            Err(e) => eprintln!("Warning: failed to parse old {}: {}", path.display(), e),
-        }
-    }
+        })
+        .collect();
 
-    for (path, content) in &new_contents {
-        match ast::extract_symbols_from_bytes(content, path) {
-            Ok(mut syms) => {
-                for sym in &mut syms {
-                    sym.file_path = path.clone();
+    let new_parsed: Vec<_> = new_contents
+        .par_iter()
+        .filter_map(|(path, content)| {
+            match ast::extract_symbols_from_bytes(content, path) {
+                Ok(mut syms) => {
+                    for sym in &mut syms {
+                        sym.file_path = path.clone();
+                    }
+                    Some((path.clone(), syms))
                 }
-                new_files_list.push(path.clone());
-                new_symbols.insert(path.clone(), syms);
+                Err(e) => {
+                    eprintln!("Warning: failed to parse new {}: {}", path.display(), e);
+                    None
+                }
             }
-            Err(e) => eprintln!("Warning: failed to parse new {}: {}", path.display(), e),
-        }
+        })
+        .collect();
+
+    for (path, syms) in old_parsed {
+        old_files_list.push(path.clone());
+        old_symbols.insert(path, syms);
+    }
+    for (path, syms) in new_parsed {
+        new_files_list.push(path.clone());
+        new_symbols.insert(path, syms);
     }
 
     run_diff_pipeline(old_symbols, new_symbols, old_files_list, new_files_list)
@@ -162,59 +184,78 @@ fn run_diff_pipeline(
     old_files: Vec<PathBuf>,
     new_files: Vec<PathBuf>,
 ) -> Result<DiffResult> {
-    let mut changes: Vec<SemanticChange> = Vec::new();
-    let mut change_id = 0;
-
-    let mut all_unmatched_old: Vec<Symbol> = Vec::new();
-    let mut all_unmatched_new: Vec<Symbol> = Vec::new();
-
     let all_old_paths: std::collections::HashSet<PathBuf> =
         old_symbols.keys().cloned().collect();
     let all_new_paths: std::collections::HashSet<PathBuf> =
         new_symbols.keys().cloned().collect();
 
-    for relpath in all_old_paths.intersection(&all_new_paths) {
-        let old_syms = &old_symbols[relpath];
-        let new_syms = &new_symbols[relpath];
+    // Parallel within-file matching
+    let common_paths: Vec<PathBuf> = all_old_paths.intersection(&all_new_paths).cloned().collect();
 
-        let match_result = matcher::match_symbols(old_syms, new_syms);
+    let per_file_results: Vec<_> = common_paths
+        .par_iter()
+        .map(|relpath| {
+            let old_syms = &old_symbols[relpath];
+            let new_syms = &new_symbols[relpath];
+            let match_result = matcher::match_symbols(old_syms, new_syms);
 
-        for (oi, ni, confidence) in &match_result.matched {
-            let old_sym = &old_syms[*oi];
-            let new_sym = &new_syms[*ni];
+            let mut file_changes = Vec::new();
+            for (oi, ni, confidence) in &match_result.matched {
+                let old_sym = &old_syms[*oi];
+                let new_sym = &new_syms[*ni];
 
-            if old_sym.body_hash == new_sym.body_hash
-                && old_sym.name == new_sym.name
-                && old_sym.visibility == new_sym.visibility
-            {
-                continue;
+                if old_sym.body_hash == new_sym.body_hash
+                    && old_sym.name == new_sym.name
+                    && old_sym.visibility == new_sym.visibility
+                {
+                    continue;
+                }
+
+                let kind = classifier::classify(old_sym, new_sym);
+                let body_d = if old_sym.body_hash != new_sym.body_hash {
+                    Some(body_diff::body_diff(&old_sym.body_text, &new_sym.body_text))
+                } else {
+                    None
+                };
+
+                file_changes.push((kind, old_sym.clone(), new_sym.clone(), *confidence, body_d));
             }
 
-            let kind = classifier::classify(old_sym, new_sym);
-            let body_d = if old_sym.body_hash != new_sym.body_hash {
-                Some(body_diff::body_diff(&old_sym.body_text, &new_sym.body_text))
-            } else {
-                None
-            };
+            let unmatched_old: Vec<Symbol> = match_result
+                .unmatched_old
+                .iter()
+                .map(|&i| old_syms[i].clone())
+                .collect();
+            let unmatched_new: Vec<Symbol> = match_result
+                .unmatched_new
+                .iter()
+                .map(|&i| new_syms[i].clone())
+                .collect();
 
+            (file_changes, unmatched_old, unmatched_new)
+        })
+        .collect();
+
+    let mut changes: Vec<SemanticChange> = Vec::new();
+    let mut change_id = 0;
+    let mut all_unmatched_old: Vec<Symbol> = Vec::new();
+    let mut all_unmatched_new: Vec<Symbol> = Vec::new();
+
+    for (file_changes, unmatched_old, unmatched_new) in per_file_results {
+        for (kind, old_sym, new_sym, confidence, body_d) in file_changes {
             changes.push(SemanticChange {
                 id: change_id,
                 kind,
-                old_symbol: Some(old_sym.clone()),
-                new_symbol: Some(new_sym.clone()),
-                confidence: *confidence,
+                old_symbol: Some(old_sym),
+                new_symbol: Some(new_sym),
+                confidence,
                 body_diff: body_d,
                 related_changes: Vec::new(),
             });
             change_id += 1;
         }
-
-        for &oi in &match_result.unmatched_old {
-            all_unmatched_old.push(old_syms[oi].clone());
-        }
-        for &ni in &match_result.unmatched_new {
-            all_unmatched_new.push(new_syms[ni].clone());
-        }
+        all_unmatched_old.extend(unmatched_old);
+        all_unmatched_new.extend(unmatched_new);
     }
 
     for relpath in all_old_paths.difference(&all_new_paths) {

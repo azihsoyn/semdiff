@@ -1,4 +1,5 @@
 use crate::ast::symbol::Symbol;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 /// A candidate match between symbols across different files
@@ -111,33 +112,40 @@ pub fn detect_cross_file_moves(
         }
     }
 
-    // Phase 3: Different name, very similar body across files
-    let mut fuzzy_candidates: Vec<CrossFileMatch> = Vec::new();
-    for (oi, old_sym) in unmatched_old.iter().enumerate() {
-        if used_old[oi] {
-            continue;
-        }
-        for (ni, new_sym) in unmatched_new.iter().enumerate() {
-            if used_new[ni] {
-                continue;
+    // Phase 3: Different name, very similar body across files (parallel)
+    let remaining_old: Vec<usize> = (0..unmatched_old.len())
+        .filter(|&i| !used_old[i])
+        .collect();
+
+    let fuzzy_candidates: Vec<CrossFileMatch> = remaining_old
+        .par_iter()
+        .flat_map(|&oi| {
+            let old_sym = &unmatched_old[oi];
+            let mut matches = Vec::new();
+            for (ni, new_sym) in unmatched_new.iter().enumerate() {
+                if used_new[ni] {
+                    continue;
+                }
+                if old_sym.kind != new_sym.kind {
+                    continue;
+                }
+                if old_sym.file_path == new_sym.file_path {
+                    continue;
+                }
+                let body_sim = old_sym.body_similarity(new_sym);
+                if body_sim > 0.7 {
+                    matches.push(CrossFileMatch {
+                        old_idx: oi,
+                        new_idx: ni,
+                        confidence: body_sim * 0.85,
+                        match_type: CrossMatchType::SimilarBody,
+                    });
+                }
             }
-            if old_sym.kind != new_sym.kind {
-                continue;
-            }
-            if old_sym.file_path == new_sym.file_path {
-                continue;
-            }
-            let body_sim = old_sym.body_similarity(new_sym);
-            if body_sim > 0.7 {
-                fuzzy_candidates.push(CrossFileMatch {
-                    old_idx: oi,
-                    new_idx: ni,
-                    confidence: body_sim * 0.85,
-                    match_type: CrossMatchType::SimilarBody,
-                });
-            }
-        }
-    }
+            matches
+        })
+        .collect();
+    let mut fuzzy_candidates = fuzzy_candidates;
 
     // Greedy assignment for fuzzy matches
     fuzzy_candidates.sort_by(|a, b| {

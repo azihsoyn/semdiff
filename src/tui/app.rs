@@ -30,6 +30,7 @@ pub struct App {
     pub repo_analysis: Option<RepoAnalysis>,
     pub summary_scroll: usize,
     pub detail_scroll: usize,
+    pub detail_h_scroll: usize,
     pub bottom_scroll: usize,
     pub should_quit: bool,
     pub llm_enabled: bool,
@@ -87,6 +88,7 @@ impl App {
             repo_analysis,
             summary_scroll: 0,
             detail_scroll: initial_scroll,
+            detail_h_scroll: 0,
             bottom_scroll: 0,
             should_quit: false,
             llm_enabled,
@@ -133,10 +135,12 @@ impl App {
             let sym = change.new_symbol.as_ref().or(change.old_symbol.as_ref());
             if let Some(sym) = sym {
                 self.detail_scroll = sym.line_range.0.saturating_sub(3);
+                self.detail_h_scroll = 0;
                 return;
             }
         }
         self.detail_scroll = 0;
+        self.detail_h_scroll = 0;
     }
 
     pub fn scroll_detail_down(&mut self) {
@@ -145,6 +149,14 @@ impl App {
 
     pub fn scroll_detail_up(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_sub(1);
+    }
+
+    pub fn scroll_detail_right(&mut self) {
+        self.detail_h_scroll = self.detail_h_scroll.saturating_add(4);
+    }
+
+    pub fn scroll_detail_left(&mut self) {
+        self.detail_h_scroll = self.detail_h_scroll.saturating_sub(4);
     }
 
     pub fn scroll_bottom_down(&mut self) {

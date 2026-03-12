@@ -47,6 +47,16 @@ fn run_event_loop(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         PanelFocus::Detail => app.scroll_detail_down(),
                         PanelFocus::Review | PanelFocus::Impact => app.scroll_bottom_down(),
                     },
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        if app.panel_focus == PanelFocus::Detail {
+                            app.scroll_detail_right();
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        if app.panel_focus == PanelFocus::Detail {
+                            app.scroll_detail_left();
+                        }
+                    }
                     KeyCode::PageUp => {
                         for _ in 0..10 {
                             match app.panel_focus {
@@ -206,6 +216,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(":focus "),
         Span::styled("j/k", Style::default().fg(Color::Cyan)),
         Span::raw(":nav "),
+        Span::styled("h/l", Style::default().fg(Color::Cyan)),
+        Span::raw(":scroll "),
         Span::styled("v", Style::default().fg(Color::Cyan)),
         Span::raw(format!(":{} ", bottom_label)),
         Span::styled("b", Style::default().fg(Color::Cyan)),

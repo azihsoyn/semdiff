@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -46,22 +47,23 @@ impl RepoIndex {
         // Batch load file contents using git cat-file --batch
         let file_contents = batch_file_contents(repo_dir, git_ref, &supported_files)?;
 
+        eprintln!("  Parsing {} files in parallel...", file_contents.len());
+
+        let parsed: Vec<(Vec<Symbol>, Vec<CallReference>)> = file_contents
+            .par_iter()
+            .map(|(path, source)| {
+                let syms = ast::extract_symbols_from_bytes(source, path).unwrap_or_default();
+                let refs = ast::extract_calls_from_bytes(source, path).unwrap_or_default();
+                (syms, refs)
+            })
+            .collect();
+
         let mut symbols = Vec::new();
         let mut call_refs = Vec::new();
-
-        for (i, (path, source)) in file_contents.iter().enumerate() {
-            if (i + 1) % 100 == 0 || i + 1 == file_contents.len() {
-                eprint!("\r  Parsing {}/{}...", i + 1, file_contents.len());
-            }
-
-            if let Ok(syms) = ast::extract_symbols_from_bytes(source, path) {
-                symbols.extend(syms);
-            }
-            if let Ok(refs) = ast::extract_calls_from_bytes(source, path) {
-                call_refs.extend(refs);
-            }
+        for (syms, refs) in parsed {
+            symbols.extend(syms);
+            call_refs.extend(refs);
         }
-        eprintln!();
 
         // Pre-compute shingles for similarity index
         eprintln!("  Pre-computing similarity data...");
@@ -130,7 +132,7 @@ impl RepoIndex {
         use crate::repo::similarity;
 
         symbols
-            .iter()
+            .par_iter()
             .map(|sym| {
                 let key = format!("{}:{}", sym.file_path.display(), sym.qualified_name);
                 let shingles: Vec<u64> =

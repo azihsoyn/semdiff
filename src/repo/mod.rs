@@ -3,6 +3,7 @@ pub mod impact;
 pub mod similarity;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -151,15 +152,13 @@ fn analyze_from_contents(
     let call_graph = CallGraph::build(file_contents)?;
     let total_edges = call_graph.total_edges;
 
-    // Extract all symbols for similarity analysis
+    // Extract all symbols for similarity analysis (parallel)
     eprintln!("  Building similarity index...");
-    let mut all_symbols: Vec<Symbol> = Vec::new();
-    for (path, source) in file_contents {
-        match ast::extract_symbols_from_bytes(source, path) {
-            Ok(syms) => all_symbols.extend(syms),
-            Err(_) => {}
-        }
-    }
+    let per_file_syms: Vec<Vec<Symbol>> = file_contents
+        .par_iter()
+        .filter_map(|(path, source)| ast::extract_symbols_from_bytes(source, path).ok())
+        .collect();
+    let all_symbols: Vec<Symbol> = per_file_syms.into_iter().flatten().collect();
     let total_symbols = all_symbols.len();
 
     // Build similarity index

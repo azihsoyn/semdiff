@@ -1,4 +1,5 @@
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,21 +27,20 @@ pub struct CallGraph {
 impl CallGraph {
     /// Build call graph from a list of files with their source bytes
     pub fn build(files: &[(PathBuf, Vec<u8>)]) -> Result<Self> {
-        let mut graph = CallGraph::default();
+        let all_refs: Vec<Vec<CallReference>> = files
+            .par_iter()
+            .filter_map(|(path, source)| {
+                if !ast::is_supported(path) {
+                    return None;
+                }
+                ast::extract_calls_from_bytes(source, path).ok()
+            })
+            .collect();
 
-        for (path, source) in files {
-            if !ast::is_supported(path) {
-                continue;
-            }
-            match ast::extract_calls_from_bytes(source, path) {
-                Ok(refs) => {
-                    for r in refs {
-                        graph.add_edge(&r);
-                    }
-                }
-                Err(_) => {
-                    // Skip files that fail to parse
-                }
+        let mut graph = CallGraph::default();
+        for refs in all_refs {
+            for r in refs {
+                graph.add_edge(&r);
             }
         }
 

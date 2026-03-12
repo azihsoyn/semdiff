@@ -83,7 +83,7 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
         // File header
         let short_file = shorten_path(file);
         items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("📁 {} ({})", short_file, change_indices.len()),
+            format!("[{}] ({})", short_file, change_indices.len()),
             Style::default()
                 .fg(ratatui::style::Color::Cyan)
                 .add_modifier(Modifier::BOLD),

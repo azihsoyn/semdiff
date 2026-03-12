@@ -600,6 +600,10 @@ fn extract_ts_node(
             }
             return;
         }
+        // Don't recurse into function bodies — local variables are not top-level symbols
+        "arrow_function" | "function_expression" | "function" => {
+            return;
+        }
         _ => {}
     }
 
@@ -648,7 +652,7 @@ fn extract_ts_function(
         name,
         qualified_name,
         file_path: path.to_path_buf(),
-        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        line_range: (start_line_with_comment(node), node.end_position().row + 1),
         signature,
         body_hash,
         body_text,
@@ -719,7 +723,7 @@ fn extract_ts_lexical(
             name,
             qualified_name,
             file_path: path.to_path_buf(),
-            line_range: (node.start_position().row + 1, node.end_position().row + 1),
+            line_range: (start_line_with_comment(node), node.end_position().row + 1),
             signature,
             body_hash,
             body_text,
@@ -745,7 +749,7 @@ fn extract_ts_class(node: Node, source: &[u8], path: &Path) -> Option<Symbol> {
         name: name.clone(),
         qualified_name: name,
         file_path: path.to_path_buf(),
-        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        line_range: (start_line_with_comment(node), node.end_position().row + 1),
         signature: String::new(),
         body_hash,
         body_text,
@@ -781,7 +785,7 @@ fn extract_ts_method(
         name: name.clone(),
         qualified_name: format!("{}.{}", class_name, name),
         file_path: path.to_path_buf(),
-        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        line_range: (start_line_with_comment(node), node.end_position().row + 1),
         signature,
         body_hash,
         body_text,
@@ -817,7 +821,7 @@ fn extract_ts_type_decl(
         name: name.clone(),
         qualified_name: name,
         file_path: path.to_path_buf(),
-        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        line_range: (start_line_with_comment(node), node.end_position().row + 1),
         signature: String::new(),
         body_hash,
         body_text,
@@ -1125,6 +1129,29 @@ fn extract_python_parameters(node: Node, source: &[u8]) -> Vec<Parameter> {
 }
 
 // ============ Helpers ============
+
+/// Get the start line of a node, extended to include any preceding JSDoc/block comment.
+/// Checks the previous sibling of the node (or its export_statement parent) for a comment.
+fn start_line_with_comment(node: Node) -> usize {
+    // The comment might be a sibling of the node itself, or of its export_statement parent
+    let target = if let Some(parent) = node.parent() {
+        if parent.kind() == "export_statement" {
+            parent
+        } else {
+            node
+        }
+    } else {
+        node
+    };
+
+    if let Some(prev) = target.prev_sibling() {
+        if prev.kind() == "comment" {
+            // Include the comment in the line range
+            return prev.start_position().row + 1;
+        }
+    }
+    node.start_position().row + 1
+}
 
 fn node_text(node: Node, source: &[u8]) -> String {
     let start = node.start_byte();

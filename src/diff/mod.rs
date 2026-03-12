@@ -88,8 +88,11 @@ fn extract_all_symbols(
 
 /// Run semantic diff between two git refs
 pub fn semantic_diff_git(repo_dir: &Path, range: &GitRange) -> Result<DiffResult> {
-    git::validate_ref(repo_dir, &range.old_ref)?;
-    git::validate_ref(repo_dir, &range.new_ref)?;
+    use std::time::Instant;
+
+    let t0 = Instant::now();
+    let old_hash = git::validate_ref(repo_dir, &range.old_ref)?;
+    let new_hash = git::validate_ref(repo_dir, &range.new_ref)?;
 
     let changed = git::changed_files(repo_dir, range)?;
 
@@ -116,20 +119,89 @@ pub fn semantic_diff_git(repo_dir: &Path, range: &GitRange) -> Result<DiffResult
         }
     }
 
-    // Batch-load old and new file contents
-    let old_refs: Vec<&str> = old_to_load.iter().map(|s| s.as_str()).collect();
-    let new_refs: Vec<&str> = new_to_load.iter().map(|s| s.as_str()).collect();
+    let t_git = Instant::now();
+    eprintln!("  git diff: {:?}", t_git - t0);
 
-    let old_contents = index::batch_load_files(repo_dir, &range.old_ref, &old_refs)?;
-    let new_contents = index::batch_load_files(repo_dir, &range.new_ref, &new_refs)?;
+    // Try to load pre-built index for acceleration
+    let cached_index = index::RepoIndex::load(repo_dir)?;
+    let old_index_hit = cached_index
+        .as_ref()
+        .map_or(false, |idx| idx.commit_hash == old_hash);
+    let new_index_hit = cached_index
+        .as_ref()
+        .map_or(false, |idx| idx.commit_hash == new_hash);
 
-    // Build symbol maps from loaded contents
-    let mut old_symbols: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-    let mut new_symbols: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
-    let mut old_files_list = Vec::new();
-    let mut new_files_list = Vec::new();
+    if old_index_hit || new_index_hit {
+        eprintln!(
+            "  index hit: old={} new={}",
+            if old_index_hit { "cached" } else { "parse" },
+            if new_index_hit { "cached" } else { "parse" },
+        );
+    }
 
-    let old_parsed: Vec<_> = old_contents
+    // Build old symbols: from index or by parsing
+    let (old_symbols, old_files_list) = if old_index_hit {
+        let idx = cached_index.as_ref().unwrap();
+        let old_set: std::collections::HashSet<PathBuf> =
+            old_to_load.iter().map(PathBuf::from).collect();
+        symbols_from_index(idx, &old_set)
+    } else {
+        let old_refs: Vec<&str> = old_to_load.iter().map(|s| s.as_str()).collect();
+        let old_contents = index::batch_load_files(repo_dir, &range.old_ref, &old_refs)?;
+        parse_file_contents(&old_contents, "old")
+    };
+
+    let t_old = Instant::now();
+    eprintln!("  old symbols: {:?} ({} files)", t_old - t_git, old_files_list.len());
+
+    // Build new symbols: from index or by parsing
+    let (new_symbols, new_files_list) = if new_index_hit {
+        let idx = cached_index.as_ref().unwrap();
+        let new_set: std::collections::HashSet<PathBuf> =
+            new_to_load.iter().map(PathBuf::from).collect();
+        symbols_from_index(idx, &new_set)
+    } else {
+        let new_refs: Vec<&str> = new_to_load.iter().map(|s| s.as_str()).collect();
+        let new_contents = index::batch_load_files(repo_dir, &range.new_ref, &new_refs)?;
+        parse_file_contents(&new_contents, "new")
+    };
+
+    let t_new = Instant::now();
+    eprintln!("  new symbols: {:?} ({} files)", t_new - t_old, new_files_list.len());
+
+    let result = run_diff_pipeline(old_symbols, new_symbols, old_files_list, new_files_list);
+
+    let t_end = Instant::now();
+    eprintln!("  diff pipeline: {:?}", t_end - t_new);
+    eprintln!("  total: {:?}", t_end - t0);
+
+    result
+}
+
+/// Extract symbols from a pre-built index, filtering to only the specified files.
+fn symbols_from_index(
+    idx: &index::RepoIndex,
+    files: &std::collections::HashSet<PathBuf>,
+) -> (HashMap<PathBuf, Vec<Symbol>>, Vec<PathBuf>) {
+    let mut symbols: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+    for sym in &idx.symbols {
+        if files.contains(&sym.file_path) {
+            symbols
+                .entry(sym.file_path.clone())
+                .or_default()
+                .push(sym.clone());
+        }
+    }
+    let files_list: Vec<PathBuf> = symbols.keys().cloned().collect();
+    (symbols, files_list)
+}
+
+/// Parse file contents into symbols (git load + tree-sitter).
+fn parse_file_contents(
+    contents: &[(PathBuf, Vec<u8>)],
+    label: &str,
+) -> (HashMap<PathBuf, Vec<Symbol>>, Vec<PathBuf>) {
+    let parsed: Vec<_> = contents
         .par_iter()
         .filter_map(|(path, content)| {
             match ast::extract_symbols_from_bytes(content, path) {
@@ -140,41 +212,20 @@ pub fn semantic_diff_git(repo_dir: &Path, range: &GitRange) -> Result<DiffResult
                     Some((path.clone(), syms))
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to parse old {}: {}", path.display(), e);
+                    eprintln!("Warning: failed to parse {} {}: {}", label, path.display(), e);
                     None
                 }
             }
         })
         .collect();
 
-    let new_parsed: Vec<_> = new_contents
-        .par_iter()
-        .filter_map(|(path, content)| {
-            match ast::extract_symbols_from_bytes(content, path) {
-                Ok(mut syms) => {
-                    for sym in &mut syms {
-                        sym.file_path = path.clone();
-                    }
-                    Some((path.clone(), syms))
-                }
-                Err(e) => {
-                    eprintln!("Warning: failed to parse new {}: {}", path.display(), e);
-                    None
-                }
-            }
-        })
-        .collect();
-
-    for (path, syms) in old_parsed {
-        old_files_list.push(path.clone());
-        old_symbols.insert(path, syms);
+    let mut symbols: HashMap<PathBuf, Vec<Symbol>> = HashMap::new();
+    let mut files_list = Vec::new();
+    for (path, syms) in parsed {
+        files_list.push(path.clone());
+        symbols.insert(path, syms);
     }
-    for (path, syms) in new_parsed {
-        new_files_list.push(path.clone());
-        new_symbols.insert(path, syms);
-    }
-
-    run_diff_pipeline(old_symbols, new_symbols, old_files_list, new_files_list)
+    (symbols, files_list)
 }
 
 /// Common diff pipeline shared between directory and git modes
@@ -184,6 +235,9 @@ fn run_diff_pipeline(
     old_files: Vec<PathBuf>,
     new_files: Vec<PathBuf>,
 ) -> Result<DiffResult> {
+    use std::time::Instant;
+    let t0 = Instant::now();
+
     let all_old_paths: std::collections::HashSet<PathBuf> =
         old_symbols.keys().cloned().collect();
     let all_new_paths: std::collections::HashSet<PathBuf> =
@@ -236,6 +290,9 @@ fn run_diff_pipeline(
         })
         .collect();
 
+    let t1 = Instant::now();
+    eprintln!("    within-file matching: {:?} ({} common files)", t1 - t0, common_paths.len());
+
     let mut changes: Vec<SemanticChange> = Vec::new();
     let mut change_id = 0;
     let mut all_unmatched_old: Vec<Symbol> = Vec::new();
@@ -270,13 +327,33 @@ fn run_diff_pipeline(
         }
     }
 
+    let t2 = Instant::now();
+    eprintln!("    unmatched: {} old, {} new symbols", all_unmatched_old.len(), all_unmatched_new.len());
+
     let cross_matches =
         cross_file::detect_cross_file_moves(&all_unmatched_old, &all_unmatched_new);
+
+    let t3 = Instant::now();
+    eprintln!("    cross-file matching: {:?} ({} matches)", t3 - t2, cross_matches.len());
 
     let mut cross_matched_old = vec![false; all_unmatched_old.len()];
     let mut cross_matched_new = vec![false; all_unmatched_new.len()];
 
-    for m in &cross_matches {
+    // Compute cross-file body diffs in parallel
+    let cross_body_diffs: Vec<_> = cross_matches
+        .par_iter()
+        .map(|m| {
+            let old_sym = &all_unmatched_old[m.old_idx];
+            let new_sym = &all_unmatched_new[m.new_idx];
+            if old_sym.body_hash != new_sym.body_hash {
+                Some(body_diff::body_diff(&old_sym.body_text, &new_sym.body_text))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (mi, m) in cross_matches.iter().enumerate() {
         let old_sym = &all_unmatched_old[m.old_idx];
         let new_sym = &all_unmatched_new[m.new_idx];
 
@@ -302,19 +379,13 @@ fn run_diff_pipeline(
             },
         };
 
-        let body_d = if old_sym.body_hash != new_sym.body_hash {
-            Some(body_diff::body_diff(&old_sym.body_text, &new_sym.body_text))
-        } else {
-            None
-        };
-
         changes.push(SemanticChange {
             id: change_id,
             kind,
             old_symbol: Some(old_sym.clone()),
             new_symbol: Some(new_sym.clone()),
             confidence: m.confidence,
-            body_diff: body_d,
+            body_diff: cross_body_diffs[mi].clone(),
             related_changes: Vec::new(),
         });
         change_id += 1;

@@ -56,6 +56,10 @@ pub struct Cli {
     /// LLM model to use
     #[arg(long)]
     pub model: Option<String>,
+
+    /// Exclude files matching glob patterns (e.g., "*.spec.ts", "**/*test*")
+    #[arg(long, short = 'x', num_args = 1..)]
+    pub exclude: Vec<String>,
 }
 
 #[derive(Subcommand)]

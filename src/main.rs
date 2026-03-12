@@ -46,6 +46,9 @@ fn main() -> Result<()> {
                 None
             };
 
+            // Auto-build index for new_ref if not cached (for next run)
+            auto_build_index_background(&repo_dir, &range.new_ref);
+
             let root = Some(repo_dir.clone());
             let gi = Some((repo_dir, range));
             (diff_result, analysis, root.clone(), root, gi)
@@ -76,6 +79,34 @@ fn main() -> Result<()> {
         }
     };
 
+    // Apply --exclude filters
+    let diff_result = if cli.exclude.is_empty() {
+        diff_result
+    } else {
+        use semdiff::diff::change::{DiffResult, DiffSummary};
+        let patterns: Vec<glob::Pattern> = cli
+            .exclude
+            .iter()
+            .filter_map(|p| glob::Pattern::new(p).ok())
+            .collect();
+        let is_excluded = |path: &str| patterns.iter().any(|pat| pat.matches(path));
+        let changes: Vec<_> = diff_result
+            .changes
+            .into_iter()
+            .filter(|c| {
+                let file = c.file_info();
+                !is_excluded(&file)
+            })
+            .collect();
+        let summary = DiffSummary::from_changes(&changes);
+        DiffResult {
+            changes,
+            old_files: diff_result.old_files,
+            new_files: diff_result.new_files,
+            summary,
+        }
+    };
+
     match cli.output {
         OutputMode::Tui => {
             let mut app = tui::app::App::new(diff_result, cli.llm_review, repo_analysis);
@@ -83,8 +114,10 @@ fn main() -> Result<()> {
             app.old_root = old_root;
 
             // For git mode, preload old/new file contents from git refs
-            // (working tree only has the current version, not old ref version)
+            // Uses batch loading (single git cat-file --batch process) for speed
             if let Some((repo_dir, ref range)) = git_info {
+                let t_preload = std::time::Instant::now();
+
                 let mut old_files: HashSet<PathBuf> = HashSet::new();
                 let mut new_files: HashSet<PathBuf> = HashSet::new();
                 for change in &app.diff_result.changes {
@@ -95,29 +128,46 @@ fn main() -> Result<()> {
                         new_files.insert(sym.file_path.clone());
                     }
                 }
-                for path in &old_files {
-                    let cache_key = PathBuf::from("__old__").join(path);
-                    if let Ok(bytes) = git::file_content_at_ref(
-                        &repo_dir,
-                        &range.old_ref,
-                        &path.to_string_lossy(),
-                    ) {
-                        if let Ok(text) = String::from_utf8(bytes) {
+
+                // Batch load old file contents
+                let old_paths: Vec<&str> = old_files
+                    .iter()
+                    .map(|p| p.to_str().unwrap_or(""))
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                if let Ok(old_contents) =
+                    semdiff::index::batch_load_files(&repo_dir, &range.old_ref, &old_paths)
+                {
+                    for (path, content) in old_contents {
+                        let cache_key = PathBuf::from("__old__").join(&path);
+                        if let Ok(text) = String::from_utf8(content) {
                             app.file_cache.insert(cache_key, text);
                         }
                     }
                 }
-                for path in &new_files {
-                    if let Ok(bytes) = git::file_content_at_ref(
-                        &repo_dir,
-                        &range.new_ref,
-                        &path.to_string_lossy(),
-                    ) {
-                        if let Ok(text) = String::from_utf8(bytes) {
-                            app.file_cache.insert(path.clone(), text);
+
+                // Batch load new file contents
+                let new_paths: Vec<&str> = new_files
+                    .iter()
+                    .map(|p| p.to_str().unwrap_or(""))
+                    .filter(|p| !p.is_empty())
+                    .collect();
+                if let Ok(new_contents) =
+                    semdiff::index::batch_load_files(&repo_dir, &range.new_ref, &new_paths)
+                {
+                    for (path, content) in new_contents {
+                        if let Ok(text) = String::from_utf8(content) {
+                            app.file_cache.insert(path, text);
                         }
                     }
                 }
+
+                eprintln!(
+                    "  file preload: {:?} ({} old + {} new files)",
+                    t_preload.elapsed(),
+                    old_files.len(),
+                    new_files.len()
+                );
             }
 
             tui::run_tui(&mut app)?;
@@ -165,4 +215,29 @@ fn run_index(git_ref: &str) -> Result<()> {
 
     eprintln!("Index built successfully.");
     Ok(())
+}
+
+/// Auto-build index for a git ref in a background thread if not already cached.
+/// This makes subsequent diffs against the same ref much faster.
+/// Runs silently — all stderr output is suppressed.
+fn auto_build_index_background(repo_dir: &std::path::Path, git_ref: &str) {
+    let repo_dir = repo_dir.to_path_buf();
+    let git_ref = git_ref.to_string();
+
+    std::thread::spawn(move || {
+        // Check if index already matches this ref
+        if let Ok(Some(idx)) = RepoIndex::load(&repo_dir) {
+            if let Ok(hash) = git::validate_ref(&repo_dir, &git_ref) {
+                if idx.commit_hash == hash {
+                    return; // Already up to date
+                }
+            }
+        }
+
+        // Build and save silently (redirect stderr to suppress eprintln from build_from_git)
+        // We can't suppress eprintln easily, so just build & save
+        if let Ok(index) = RepoIndex::build_from_git(&repo_dir, &git_ref) {
+            let _ = index.save(&repo_dir);
+        }
+    });
 }

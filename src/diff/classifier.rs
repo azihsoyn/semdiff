@@ -37,15 +37,18 @@ pub fn classify(old: &Symbol, new: &Symbol) -> ChangeKind {
         };
     }
 
-    if body_changed {
-        return ChangeKind::BodyChanged;
-    }
-
     if vis_changed {
+        // Visibility changed — even if body also changed slightly (e.g., due to
+        // export keyword inclusion), prefer VisibilityChanged for clarity.
+        // If body also has significant changes, they'll show in the diff view.
         return ChangeKind::VisibilityChanged {
             old: old.visibility.clone(),
             new: new.visibility.clone(),
         };
+    }
+
+    if body_changed {
+        return ChangeKind::BodyChanged;
     }
 
     // No detectable change (shouldn't reach here if filtering works)

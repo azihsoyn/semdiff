@@ -4,6 +4,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::diff::change::ChangeKind;
 use crate::tui::app::{App, PanelFocus};
 use crate::tui::theme;
 
@@ -14,8 +15,18 @@ pub fn render(f: &mut Frame, area: Rect, app: &mut App) {
         theme::normal_border_style()
     };
 
+    let title = if let Some(change) = app.selected_change() {
+        match &change.kind {
+            ChangeKind::Added => " New File ".to_string(),
+            ChangeKind::Deleted => " Deleted File ".to_string(),
+            _ => " Side-by-Side Diff ".to_string(),
+        }
+    } else {
+        " Diff ".to_string()
+    };
+
     let block = Block::default()
-        .title(" Side-by-Side Diff ")
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style);
 

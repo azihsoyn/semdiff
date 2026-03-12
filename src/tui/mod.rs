@@ -80,15 +80,30 @@ fn run_event_loop(mut terminal: DefaultTerminal, app: &mut App) -> Result<()> {
                         }
                     }
                     KeyCode::Home => {
-                        app.nav_pos = 0;
-                        app.selected_index = app.nav_order.first().copied().unwrap_or(0);
-                        app.auto_scroll_detail();
+                        // Find first visible item
+                        for (pos, &idx) in app.nav_order.iter().enumerate() {
+                            if !app.is_collapsed_nav(idx) {
+                                app.nav_pos = pos;
+                                app.selected_index = idx;
+                                app.auto_scroll_detail();
+                                break;
+                            }
+                        }
                     }
                     KeyCode::End => {
-                        if !app.nav_order.is_empty() {
-                            app.nav_pos = app.nav_order.len() - 1;
-                            app.selected_index = app.nav_order[app.nav_pos];
-                            app.auto_scroll_detail();
+                        // Find last visible item
+                        for (pos, &idx) in app.nav_order.iter().enumerate().rev() {
+                            if !app.is_collapsed_nav(idx) {
+                                app.nav_pos = pos;
+                                app.selected_index = idx;
+                                app.auto_scroll_detail();
+                                break;
+                            }
+                        }
+                    }
+                    KeyCode::Char('z') | KeyCode::Enter => {
+                        if app.panel_focus == PanelFocus::Summary {
+                            app.toggle_file_collapse();
                         }
                     }
                     _ => {}
@@ -222,7 +237,8 @@ fn render_footer(f: &mut Frame, area: Rect, app: &App) {
         Span::raw(format!(":{} ", bottom_label)),
         Span::styled("b", Style::default().fg(Color::Cyan)),
         Span::raw(":switch "),
-        Span::raw("  "),
+        Span::styled("z", Style::default().fg(Color::Cyan)),
+        Span::raw(":fold "),
         status,
     ]);
 

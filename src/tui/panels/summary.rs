@@ -80,6 +80,9 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
         }
     }
 
+    // Sort file groups by directory path (like a file explorer tree)
+    file_groups.sort_by(|(a, _), (b, _)| cmp_file_paths(a, b));
+
     // Sort changes within each file by line number (top of file first)
     for (_, indices) in &mut file_groups {
         indices.sort_by_key(|&i| {
@@ -94,16 +97,23 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
     }
 
     for (file, change_indices) in &file_groups {
+        let is_collapsed = app.collapsed_files.contains(file);
+        let arrow = if is_collapsed { "▸" } else { "▾" };
+
         // File header
         let short_file = shorten_path(file);
         items.push(ListItem::new(Line::from(vec![Span::styled(
-            format!("[{}] ({})", short_file, change_indices.len()),
+            format!("{} [{}] ({})", arrow, short_file, change_indices.len()),
             Style::default()
                 .fg(ratatui::style::Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )])));
-        // File headers are not selectable — use None
-        index_map.push(None);
+        // Map file header to the first change in the group (so it's selectable for collapse toggle)
+        index_map.push(Some(change_indices[0]));
+
+        if is_collapsed {
+            continue;
+        }
 
         // Compute nesting depth for indentation
         let nesting = compute_nesting(change_indices, &app.diff_result.changes);
@@ -150,6 +160,27 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
     }
 
     (items, index_map)
+}
+
+/// Compare file paths for directory-structure ordering.
+/// Files in the same directory group together; directories sort before deeper paths.
+/// Within the same directory, files are sorted alphabetically.
+fn cmp_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_parts: Vec<&str> = a.split('/').collect();
+    let b_parts: Vec<&str> = b.split('/').collect();
+
+    // Compare path components one by one
+    for (ap, bp) in a_parts.iter().zip(b_parts.iter()) {
+        let ac = ap.to_lowercase();
+        let bc = bp.to_lowercase();
+        match ac.cmp(&bc) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+
+    // Shorter path (shallower) comes first
+    a_parts.len().cmp(&b_parts.len())
 }
 
 /// Shorten a file path for display (show last 2-3 components)

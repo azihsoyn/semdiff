@@ -49,6 +49,8 @@ pub struct App {
     pub nav_order: Vec<usize>,
     /// Current position in nav_order
     pub nav_pos: usize,
+    /// Collapsed file groups in summary panel (file_info string → collapsed)
+    pub collapsed_files: std::collections::HashSet<String>,
 }
 
 impl App {
@@ -101,6 +103,7 @@ impl App {
             summary_list_state: ListState::default(),
             nav_order,
             nav_pos: 0,
+            collapsed_files: std::collections::HashSet::new(),
         }
     }
 
@@ -113,21 +116,11 @@ impl App {
     }
 
     pub fn select_next(&mut self) {
-        if self.nav_pos + 1 < self.nav_order.len() {
-            self.nav_pos += 1;
-            self.selected_index = self.nav_order[self.nav_pos];
-            self.auto_scroll_detail();
-            self.bottom_scroll = 0;
-        }
+        self.select_next_visible();
     }
 
     pub fn select_prev(&mut self) {
-        if self.nav_pos > 0 {
-            self.nav_pos -= 1;
-            self.selected_index = self.nav_order[self.nav_pos];
-            self.auto_scroll_detail();
-            self.bottom_scroll = 0;
-        }
+        self.select_prev_visible();
     }
 
     /// Auto-scroll detail panel to the first changed line within the selected block.
@@ -277,6 +270,85 @@ impl App {
         self.repo_analysis.is_some()
     }
 
+    /// Get the file key for a given change index
+    fn file_key_for_change(&self, idx: usize) -> Option<String> {
+        self.diff_result.changes.get(idx).map(|c| c.file_info())
+    }
+
+    /// Toggle collapse state for the file group of the currently selected change.
+    pub fn toggle_file_collapse(&mut self) {
+        if let Some(file_key) = self.file_key_for_change(self.selected_index) {
+            if self.collapsed_files.contains(&file_key) {
+                self.collapsed_files.remove(&file_key);
+            } else {
+                self.collapsed_files.insert(file_key);
+            }
+        }
+    }
+
+    /// Move to the next visible item in nav_order (skipping collapsed items).
+    pub fn select_next_visible(&mut self) {
+        let mut pos = self.nav_pos + 1;
+        while pos < self.nav_order.len() {
+            let idx = self.nav_order[pos];
+            if !self.is_collapsed_nav(idx) {
+                self.nav_pos = pos;
+                self.selected_index = idx;
+                self.auto_scroll_detail();
+                self.bottom_scroll = 0;
+                return;
+            }
+            pos += 1;
+        }
+    }
+
+    /// Move to the previous visible item in nav_order (skipping collapsed items).
+    pub fn select_prev_visible(&mut self) {
+        if self.nav_pos == 0 {
+            return;
+        }
+        let mut pos = self.nav_pos - 1;
+        loop {
+            let idx = self.nav_order[pos];
+            if !self.is_collapsed_nav(idx) {
+                self.nav_pos = pos;
+                self.selected_index = idx;
+                self.auto_scroll_detail();
+                self.bottom_scroll = 0;
+                return;
+            }
+            if pos == 0 {
+                break;
+            }
+            pos -= 1;
+        }
+    }
+
+    /// Check if a change index belongs to a collapsed file group,
+    /// but allow the first change in each file group to remain visible (as the representative).
+    /// Used by navigation (select_next/prev) to skip hidden items.
+    pub fn is_collapsed_nav(&self, idx: usize) -> bool {
+        if let Some(file_key) = self.file_key_for_change(idx) {
+            if self.collapsed_files.contains(&file_key) {
+                // Allow the first change in this file group to be visible
+                return !self.is_first_in_file_group(idx, &file_key);
+            }
+        }
+        false
+    }
+
+    /// Check if this change index is the first one in its file group (in nav_order).
+    fn is_first_in_file_group(&self, idx: usize, file_key: &str) -> bool {
+        for &nav_idx in &self.nav_order {
+            if let Some(key) = self.file_key_for_change(nav_idx) {
+                if key == file_key {
+                    return nav_idx == idx;
+                }
+            }
+        }
+        false
+    }
+
     /// Load full file content for display (new/current version), with caching
     pub fn load_file_content(&mut self, rel_path: &std::path::Path) -> Option<&str> {
         if !self.file_cache.contains_key(rel_path) {
@@ -313,6 +385,21 @@ impl App {
     }
 }
 
+/// Compare file paths for directory-structure ordering (same as summary panel).
+fn cmp_file_paths(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_parts: Vec<&str> = a.split('/').collect();
+    let b_parts: Vec<&str> = b.split('/').collect();
+    for (ap, bp) in a_parts.iter().zip(b_parts.iter()) {
+        let ac = ap.to_lowercase();
+        let bc = bp.to_lowercase();
+        match ac.cmp(&bc) {
+            std::cmp::Ordering::Equal => continue,
+            other => return other,
+        }
+    }
+    a_parts.len().cmp(&b_parts.len())
+}
+
 /// Build navigation order: change indices grouped by file, matching summary panel display.
 fn build_nav_order(diff_result: &DiffResult) -> Vec<usize> {
     let mut file_groups: Vec<(String, Vec<usize>)> = Vec::new();
@@ -328,6 +415,9 @@ fn build_nav_order(diff_result: &DiffResult) -> Vec<usize> {
             file_groups.push((file, vec![i]));
         }
     }
+
+    // Sort file groups by directory path (matching summary panel order)
+    file_groups.sort_by(|(a, _), (b, _)| cmp_file_paths(a, b));
 
     // Sort changes within each file by line number (top of file first)
     for (_, indices) in &mut file_groups {

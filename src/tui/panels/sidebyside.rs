@@ -39,6 +39,14 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
     let old_file = change.old_symbol.as_ref().map(|s| s.file_path.clone());
     let new_file = change.new_symbol.as_ref().map(|s| s.file_path.clone());
 
+    // Detect pure-add or pure-delete files (no cross-file moves involved)
+    let single_column_mode = detect_single_column_mode(change, &app.diff_result.changes);
+
+    if single_column_mode != SingleColumnMode::None {
+        render_single_column(f, area, app, single_column_mode);
+        return;
+    }
+
     // For DEL (no new_symbol) or ADD (no old_symbol), use the other side's path
     // so both panels show the file for context
     let display_old_file = old_file.clone().or_else(|| new_file.clone());
@@ -171,6 +179,222 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
     f.render_widget(Paragraph::new(new_visible), panels[1]);
 }
 
+// === Single-column rendering for pure ADD/DEL files ===
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SingleColumnMode {
+    None,
+    Added,   // Pure new file — show full width
+    Deleted, // Pure deleted file — show full width
+}
+
+/// Check if the selected change's file is a pure-add or pure-delete file.
+/// A file is "pure add" if all changes for that file path are Added (no moves into it).
+/// A file is "pure delete" if all changes for that file path are Deleted (no moves from it).
+fn detect_single_column_mode(
+    selected: &SemanticChange,
+    all_changes: &[SemanticChange],
+) -> SingleColumnMode {
+    // Only applies to ADD or DEL changes
+    let (target_file, candidate_mode) = match &selected.kind {
+        ChangeKind::Added => {
+            if let Some(ref sym) = selected.new_symbol {
+                (&sym.file_path, SingleColumnMode::Added)
+            } else {
+                return SingleColumnMode::None;
+            }
+        }
+        ChangeKind::Deleted => {
+            if let Some(ref sym) = selected.old_symbol {
+                (&sym.file_path, SingleColumnMode::Deleted)
+            } else {
+                return SingleColumnMode::None;
+            }
+        }
+        _ => return SingleColumnMode::None,
+    };
+
+    // Check all changes involving this file
+    for change in all_changes {
+        match candidate_mode {
+            SingleColumnMode::Added => {
+                // Check if any change has new_symbol in this file that isn't Added
+                if let Some(ref sym) = change.new_symbol {
+                    if sym.file_path == *target_file && !matches!(change.kind, ChangeKind::Added) {
+                        return SingleColumnMode::None;
+                    }
+                }
+            }
+            SingleColumnMode::Deleted => {
+                // Check if any change has old_symbol in this file that isn't Deleted
+                if let Some(ref sym) = change.old_symbol {
+                    if sym.file_path == *target_file && !matches!(change.kind, ChangeKind::Deleted)
+                    {
+                        return SingleColumnMode::None;
+                    }
+                }
+            }
+            SingleColumnMode::None => unreachable!(),
+        }
+    }
+
+    candidate_mode
+}
+
+/// Render a single-column view for pure ADD or DEL files.
+/// Shows full-width file content with block borders for each symbol.
+fn render_single_column(
+    f: &mut Frame,
+    area: Rect,
+    app: &mut App,
+    mode: SingleColumnMode,
+) {
+    let change = app.selected_change().unwrap();
+    let file_path = match mode {
+        SingleColumnMode::Added => change.new_symbol.as_ref().map(|s| s.file_path.clone()),
+        SingleColumnMode::Deleted => change.old_symbol.as_ref().map(|s| s.file_path.clone()),
+        SingleColumnMode::None => unreachable!(),
+    };
+
+    let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+
+    // Header
+    let (label, header_color) = match mode {
+        SingleColumnMode::Added => ("+ (new file)", Color::Green),
+        SingleColumnMode::Deleted => ("- (deleted file)", Color::Red),
+        SingleColumnMode::None => unreachable!(),
+    };
+    let path_str = file_path
+        .as_ref()
+        .map(|p| format!(" {} {}", label, p.display()))
+        .unwrap_or_else(|| format!(" {}", label));
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            path_str,
+            Style::default().fg(header_color).add_modifier(Modifier::BOLD),
+        ))),
+        chunks[0],
+    );
+
+    // Load file content
+    let file_content = match mode {
+        SingleColumnMode::Added => file_path
+            .as_ref()
+            .and_then(|p| app.load_file_content(p))
+            .map(|s| s.to_string()),
+        SingleColumnMode::Deleted => file_path
+            .as_ref()
+            .and_then(|p| app.load_old_file_content(p))
+            .map(|s| s.to_string()),
+        SingleColumnMode::None => unreachable!(),
+    };
+    let file_fallback = match mode {
+        SingleColumnMode::Added => app
+            .selected_change()
+            .and_then(|c| c.new_symbol.as_ref())
+            .map(|s| s.body_text.clone()),
+        SingleColumnMode::Deleted => app
+            .selected_change()
+            .and_then(|c| c.old_symbol.as_ref())
+            .map(|s| s.body_text.clone()),
+        SingleColumnMode::None => unreachable!(),
+    };
+    let file_text = file_content
+        .as_deref()
+        .or(file_fallback.as_deref())
+        .unwrap_or("");
+
+    // Build block regions for this file
+    let all_changes: Vec<&SemanticChange> = app.diff_result.changes.iter().collect();
+    let selected_idx = app.selected_index;
+    let regions = match mode {
+        SingleColumnMode::Added => {
+            let (_, new_regions) = build_block_regions(
+                &all_changes,
+                None,
+                file_path.as_deref(),
+                selected_idx,
+            );
+            new_regions
+        }
+        SingleColumnMode::Deleted => {
+            let (old_regions, _) = build_block_regions(
+                &all_changes,
+                file_path.as_deref(),
+                None,
+                selected_idx,
+            );
+            old_regions
+        }
+        SingleColumnMode::None => unreachable!(),
+    };
+
+    let scroll = app.detail_scroll;
+    let h_scroll = app.detail_h_scroll;
+    let panel_width = chunks[1].width as usize;
+    let visible_height = chunks[1].height as usize;
+    let border_width = panel_width.saturating_sub(1);
+
+    // Render all lines with block borders
+    let file_lines: Vec<&str> = file_text.lines().collect();
+    let region_map = build_region_map(&regions);
+    let mut vlines: Vec<Line> = Vec::new();
+
+    let mut top_emitted: HashSet<usize> = HashSet::new();
+    let mut bottom_emitted: HashSet<usize> = HashSet::new();
+
+    for line_num in 1..=file_lines.len() {
+        // Top borders
+        let starting = starting_regions(&regions, &region_map, Some(line_num), &top_emitted);
+        for &ri in &starting {
+            let prefix = border_nesting_prefix(&regions, &region_map, line_num, ri);
+            let r = &regions[ri];
+            top_emitted.insert(ri);
+            vlines.push(render_border_top(
+                prefix,
+                BLOCK_COLORS[r.color_idx],
+                &r.label,
+                border_width,
+                r.is_selected,
+            ));
+        }
+
+        // Content line
+        let prefix = nesting_prefix(&regions, &region_map, line_num);
+        let info = get_region_info(&regions, &region_map, line_num);
+        // Don't highlight content — just show border box
+        let info = info.map(|mut i| {
+            i.is_changed = false;
+            i
+        });
+        let text = file_lines.get(line_num - 1).copied().unwrap_or("");
+        vlines.push(render_content_line(line_num, text, info, prefix, h_scroll));
+
+        // Bottom borders
+        let ending = ending_regions(&regions, &region_map, Some(line_num), &bottom_emitted);
+        for &ri in &ending {
+            let prefix = border_nesting_prefix(&regions, &region_map, line_num, ri);
+            let r = &regions[ri];
+            bottom_emitted.insert(ri);
+            vlines.push(render_border_bottom(
+                prefix,
+                BLOCK_COLORS[r.color_idx],
+                border_width,
+                r.is_selected,
+            ));
+        }
+    }
+
+    // Scroll
+    let scroll_vline = find_scroll_vline(&vlines, scroll);
+    let mut visible: Vec<Line> = Vec::with_capacity(visible_height);
+    for i in scroll_vline..(scroll_vline + visible_height) {
+        visible.push(vlines.get(i).cloned().unwrap_or_else(tilde_line));
+    }
+
+    f.render_widget(Paragraph::new(visible), chunks[1]);
+}
+
 fn tilde_line<'a>() -> Line<'a> {
     Line::from(Span::styled("~", Style::default().fg(Color::DarkGray)))
 }
@@ -285,12 +509,10 @@ fn render_aligned_rows<'a>(
                 let new_info = get_region_info(new_regions, &new_region_map, *new_line);
                 let ot = old_file_lines.get(*old_line - 1).copied().unwrap_or("");
                 let nt = new_file_lines.get(*new_line - 1).copied().unwrap_or("");
-                // Use word-level diff when both sides are changed within a block
-                let both_changed = old_info
-                    .as_ref()
-                    .map_or(false, |i| i.is_changed)
-                    && new_info.as_ref().map_or(false, |i| i.is_changed);
-                if both_changed && ot != nt {
+                // For Both rows: use word-level diff when text differs within a block,
+                // otherwise just show the border box without background highlighting
+                let in_block = old_info.is_some() && new_info.is_some();
+                if in_block && ot != nt {
                     let (old_spans, new_spans) = render_word_diff_line(
                         *old_line,
                         *new_line,
@@ -305,21 +527,52 @@ fn render_aligned_rows<'a>(
                     old_result.push(old_spans);
                     new_result.push(new_spans);
                 } else {
-                    old_result.push(render_content_line(*old_line, ot, old_info, old_prefix, h_scroll));
-                    new_result.push(render_content_line(*new_line, nt, new_info, new_prefix, h_scroll));
+                    // Both rows never get bg highlight — border only.
+                    // Highlight is reserved for OldOnly/NewOnly (actual diff lines).
+                    let old_clean = old_info.map(|mut i| { i.is_changed = false; i });
+                    let new_clean = new_info.map(|mut i| { i.is_changed = false; i });
+                    old_result.push(render_content_line(*old_line, ot, old_clean, old_prefix, h_scroll));
+                    new_result.push(render_content_line(*new_line, nt, new_clean, new_prefix, h_scroll));
                 }
             }
             AlignedRow::OldOnly { old_line } => {
                 let old_prefix = nesting_prefix(old_regions, &old_region_map, *old_line);
-                let old_info = get_region_info_as_changed(old_regions, &old_region_map, *old_line);
+                let old_info = get_region_info(old_regions, &old_region_map, *old_line);
                 let ot = old_file_lines.get(*old_line - 1).copied().unwrap_or("");
+                // Inside a block: only highlight if body_diff marks this line as changed.
+                // Outside blocks: use a dim red to indicate file-level deletion.
+                let old_info = if old_info.as_ref().map_or(false, |i| !i.is_changed) {
+                    // Inside block, not changed → border only
+                    old_info
+                } else if old_info.is_some() {
+                    // Inside block, changed → use block color
+                    get_region_info_as_changed(old_regions, &old_region_map, *old_line)
+                } else {
+                    // Outside any block → dim red (file-level diff line)
+                    Some(ContentRegionInfo {
+                        color: Color::DarkGray,
+                        is_changed: true,
+                        is_selected: false,
+                    })
+                };
                 old_result.push(render_content_line(*old_line, ot, old_info, old_prefix, h_scroll));
                 new_result.push(padding_line());
             }
             AlignedRow::NewOnly { new_line } => {
                 let new_prefix = nesting_prefix(new_regions, &new_region_map, *new_line);
-                let new_info = get_region_info_as_changed(new_regions, &new_region_map, *new_line);
+                let new_info = get_region_info(new_regions, &new_region_map, *new_line);
                 let nt = new_file_lines.get(*new_line - 1).copied().unwrap_or("");
+                let new_info = if new_info.as_ref().map_or(false, |i| !i.is_changed) {
+                    new_info
+                } else if new_info.is_some() {
+                    get_region_info_as_changed(new_regions, &new_region_map, *new_line)
+                } else {
+                    Some(ContentRegionInfo {
+                        color: Color::DarkGray,
+                        is_changed: true,
+                        is_selected: false,
+                    })
+                };
                 old_result.push(padding_line());
                 new_result.push(render_content_line(*new_line, nt, new_info, new_prefix, h_scroll));
             }
@@ -575,6 +828,9 @@ enum BlockKind {
     Modified,
     Extracted,
     Inlined,
+    Renamed,
+    Signature,
+    Visibility,
 }
 
 fn classify_block_kind(kind: &ChangeKind) -> BlockKind {
@@ -584,6 +840,9 @@ fn classify_block_kind(kind: &ChangeKind) -> BlockKind {
         ChangeKind::Moved { .. } | ChangeKind::MovedAndModified { .. } => BlockKind::Moved,
         ChangeKind::Extracted { .. } => BlockKind::Extracted,
         ChangeKind::Inlined { .. } => BlockKind::Inlined,
+        ChangeKind::Renamed { .. } => BlockKind::Renamed,
+        ChangeKind::SignatureChanged { .. } => BlockKind::Signature,
+        ChangeKind::VisibilityChanged { .. } => BlockKind::Visibility,
         _ => BlockKind::Modified,
     }
 }
@@ -619,6 +878,28 @@ fn build_label(change: &SemanticChange, kind: BlockKind, is_old: bool) -> String
         BlockKind::Added => format!("+ {}", name),
         BlockKind::Deleted => format!("- {}", name),
         BlockKind::Modified => format!("~ {}", name),
+        BlockKind::Renamed => {
+            if let ChangeKind::Renamed { old_name, new_name } = &change.kind {
+                if is_old {
+                    format!("REN {} -> {}", old_name, new_name)
+                } else {
+                    format!("REN {} -> {}", old_name, new_name)
+                }
+            } else {
+                format!("~ {}", name)
+            }
+        }
+        BlockKind::Signature => {
+            let desc = change.kind.short_description();
+            format!("SIG {} ({})", name, desc)
+        }
+        BlockKind::Visibility => {
+            if let ChangeKind::VisibilityChanged { old, new } = &change.kind {
+                format!("VIS {} ({} -> {})", name, old, new)
+            } else {
+                format!("~ {}", name)
+            }
+        }
     }
 }
 

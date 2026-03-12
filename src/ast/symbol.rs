@@ -87,6 +87,11 @@ pub struct Symbol {
 impl Symbol {
     /// Compute body similarity with another symbol (0.0 - 1.0)
     pub fn body_similarity(&self, other: &Symbol) -> f64 {
+        self.body_similarity_threshold(other, 0.0)
+    }
+
+    /// Compute body similarity, returning 0.0 early if it can't exceed threshold.
+    pub fn body_similarity_threshold(&self, other: &Symbol, threshold: f64) -> f64 {
         if self.body_hash == other.body_hash {
             return 1.0;
         }
@@ -101,9 +106,27 @@ impl Symbol {
             return 0.0;
         }
 
-        let distance = levenshtein(a, b);
         let max_len = a.len().max(b.len());
-        1.0 - (distance as f64 / max_len as f64)
+        let min_len = a.len().min(b.len());
+
+        // Length-based upper bound: similarity can't exceed min_len/max_len
+        let length_upper_bound = min_len as f64 / max_len as f64;
+        if length_upper_bound < threshold {
+            return 0.0;
+        }
+
+        // Cap comparison at 1000 chars for performance
+        let (a_cmp, b_cmp) = if max_len > 1000 {
+            (&a[..a.len().min(1000)], &b[..b.len().min(1000)])
+        } else {
+            (a.as_str(), b.as_str())
+        };
+
+        // Use early-termination Levenshtein with max allowed distance
+        let max_distance = ((1.0 - threshold) * max_len as f64) as usize;
+        let distance = levenshtein_bounded(a_cmp, b_cmp, max_distance);
+        let cmp_max = a_cmp.len().max(b_cmp.len());
+        1.0 - (distance as f64 / cmp_max as f64)
     }
 
     /// Compute name similarity with another symbol (0.0 - 1.0)
@@ -111,11 +134,11 @@ impl Symbol {
         if self.name == other.name {
             return 1.0;
         }
-        let distance = levenshtein(&self.name, &other.name);
         let max_len = self.name.len().max(other.name.len());
         if max_len == 0 {
             return 1.0;
         }
+        let distance = levenshtein_bounded(&self.name, &other.name, max_len);
         1.0 - (distance as f64 / max_len as f64)
     }
 
@@ -142,36 +165,60 @@ impl Symbol {
     }
 }
 
-/// Simple Levenshtein distance
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    let m = a_chars.len();
-    let n = b_chars.len();
+/// Levenshtein distance with early termination and O(n) space.
+/// Returns `max_dist + 1` if the actual distance would exceed `max_dist`.
+fn levenshtein_bounded(a: &str, b: &str, max_dist: usize) -> usize {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let m = a_bytes.len();
+    let n = b_bytes.len();
 
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
-
-    for i in 0..=m {
-        dp[i][0] = i;
+    // Quick length check
+    if m.abs_diff(n) > max_dist {
+        return max_dist + 1;
     }
+
+    if m == 0 {
+        return n;
+    }
+    if n == 0 {
+        return m;
+    }
+
+    // O(n) space: two rows
+    let mut prev = vec![0usize; n + 1];
+    let mut curr = vec![0usize; n + 1];
+
     for j in 0..=n {
-        dp[0][j] = j;
+        prev[j] = j;
     }
 
     for i in 1..=m {
+        curr[0] = i;
+        let mut row_min = curr[0];
+
         for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+            let cost = if a_bytes[i - 1] == b_bytes[j - 1] {
                 0
             } else {
                 1
             };
-            dp[i][j] = (dp[i - 1][j] + 1)
-                .min(dp[i][j - 1] + 1)
-                .min(dp[i - 1][j - 1] + cost);
+            curr[j] = (prev[j] + 1)
+                .min(curr[j - 1] + 1)
+                .min(prev[j - 1] + cost);
+            row_min = row_min.min(curr[j]);
         }
+
+        // Early termination: if the minimum value in this row exceeds max_dist,
+        // the final result will too
+        if row_min > max_dist {
+            return max_dist + 1;
+        }
+
+        std::mem::swap(&mut prev, &mut curr);
     }
 
-    dp[m][n]
+    prev[n]
 }
 
 /// Normalize source body for comparison

@@ -1,0 +1,38 @@
+[package]
+name = "semdiff"
+version = "0.1.0"
+edition = "2021"
+description = "Semantic diff tool - structure-aware code diff with cross-file move detection"
+
+[dependencies]
+# AST parsing
+tree-sitter = "0.24"
+tree-sitter-rust = "0.23"
+tree-sitter-go = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-python = "0.23"
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Similarity / hashing
+similar = "2"
+blake3 = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async (for LLM API calls)
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", features = ["json"] }

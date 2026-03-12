@@ -18,6 +18,7 @@ fn main() -> Result<()> {
     if let Some(cmd) = &cli.command {
         return match cmd {
             Command::Index { git_ref } => run_index(git_ref),
+            Command::Symbols { file } => run_symbols(file),
         };
     }
 
@@ -132,6 +133,26 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn run_symbols(file: &std::path::Path) -> Result<()> {
+    use semdiff::ast;
+    let symbols = ast::extract_file_symbols(file)?;
+    if symbols.is_empty() {
+        eprintln!("No symbols extracted from {}", file.display());
+    }
+    for sym in &symbols {
+        println!(
+            "  {:12} {:40} lines {}-{}  (body: {} chars)",
+            format!("[{:?}]", sym.kind),
+            sym.qualified_name,
+            sym.line_range.0,
+            sym.line_range.1,
+            sym.body_text.len(),
+        );
+    }
+    println!("Total: {} symbols", symbols.len());
     Ok(())
 }
 

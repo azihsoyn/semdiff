@@ -1,4 +1,5 @@
-use crate::diff::change::{DiffResult, SemanticChange};
+use crate::diff::body_diff::DiffLineTag;
+use crate::diff::change::{ChangeKind, DiffResult, SemanticChange};
 use crate::llm::review::ReviewResult;
 use crate::repo::RepoAnalysis;
 use ratatui::widgets::ListState;
@@ -69,11 +70,11 @@ impl App {
         // selected_index = first change in nav order
         let selected_index = nav_order.first().copied().unwrap_or(0);
 
-        // Auto-scroll to first change's location for side-by-side view
+        // Auto-scroll to first change's location (old-side based)
         let initial_scroll = diff_result
             .changes
             .get(selected_index)
-            .and_then(|c| c.new_symbol.as_ref().or(c.old_symbol.as_ref()))
+            .and_then(|c| c.old_symbol.as_ref().or(c.new_symbol.as_ref()))
             .map(|s| s.line_range.0.saturating_sub(3))
             .unwrap_or(0);
 
@@ -129,12 +130,16 @@ impl App {
         }
     }
 
-    /// Auto-scroll detail panel to the selected change's location.
+    /// Auto-scroll detail panel to the first changed line within the selected block.
+    /// Uses old-side line numbers since the aligned view preserves old line order.
+    /// Falls back to new_symbol if no old_symbol exists (ADD changes).
     pub fn auto_scroll_detail(&mut self) {
         if let Some(change) = self.diff_result.changes.get(self.selected_index) {
-            let sym = change.new_symbol.as_ref().or(change.old_symbol.as_ref());
+            let sym = change.old_symbol.as_ref().or(change.new_symbol.as_ref());
             if let Some(sym) = sym {
-                self.detail_scroll = sym.line_range.0.saturating_sub(3);
+                // Try to find the first changed line within the block (old-side)
+                let first_changed = find_first_changed_line(change, sym.line_range.0);
+                self.detail_scroll = first_changed.saturating_sub(5);
                 self.detail_h_scroll = 0;
                 return;
             }
@@ -155,14 +160,16 @@ impl App {
 
     /// When scrolling in the detail panel, if the viewport enters a different
     /// block's line range, auto-select that block in the summary panel.
+    /// Uses old-side line numbers (matching detail_scroll).
+    /// Prefers the most specific (smallest) block when multiple blocks overlap.
     fn sync_selection_from_scroll(&mut self) {
-        // Determine the file currently being viewed (from new_symbol, or old_symbol)
+        // Determine the file currently being viewed (prefer old side to match scroll)
         let current_file = self
             .selected_change()
             .and_then(|c| {
-                c.new_symbol
+                c.old_symbol
                     .as_ref()
-                    .or(c.old_symbol.as_ref())
+                    .or(c.new_symbol.as_ref())
                     .map(|s| s.file_path.clone())
             });
         let Some(current_file) = current_file else {
@@ -172,29 +179,36 @@ impl App {
         // Use a line a few rows into the visible area as the "probe" line
         let probe_line = self.detail_scroll + 5;
 
-        // Find which change's line range contains the probe line
+        // Find the most specific (smallest range) change whose line range contains the probe line
+        // Use old_symbol line ranges since detail_scroll is old-side based
+        let mut best: Option<(usize, usize)> = None; // (change_index, range_size)
         for (i, change) in self.diff_result.changes.iter().enumerate() {
             if i == self.selected_index {
                 continue;
             }
-            // Check new_symbol first (primary for the new side), then old_symbol
             let sym = change
-                .new_symbol
+                .old_symbol
                 .as_ref()
-                .or(change.old_symbol.as_ref());
+                .or(change.new_symbol.as_ref());
             if let Some(sym) = sym {
                 if sym.file_path == current_file
                     && probe_line >= sym.line_range.0
                     && probe_line <= sym.line_range.1
                 {
-                    self.selected_index = i;
-                    if let Some(pos) = self.nav_order.iter().position(|&idx| idx == i) {
-                        self.nav_pos = pos;
+                    let size = sym.line_range.1 - sym.line_range.0;
+                    if best.map_or(true, |(_, best_size)| size < best_size) {
+                        best = Some((i, size));
                     }
-                    self.bottom_scroll = 0;
-                    return;
                 }
             }
+        }
+
+        if let Some((i, _)) = best {
+            self.selected_index = i;
+            if let Some(pos) = self.nav_order.iter().position(|&idx| idx == i) {
+                self.nav_pos = pos;
+            }
+            self.bottom_scroll = 0;
         }
     }
 
@@ -315,9 +329,59 @@ fn build_nav_order(diff_result: &DiffResult) -> Vec<usize> {
         }
     }
 
+    // Sort changes within each file by line number (top of file first)
+    for (_, indices) in &mut file_groups {
+        indices.sort_by_key(|&i| {
+            let change = &diff_result.changes[i];
+            change
+                .new_symbol
+                .as_ref()
+                .or(change.old_symbol.as_ref())
+                .map(|s| s.line_range.0)
+                .unwrap_or(0)
+        });
+    }
+
     // Flatten: file group order → changes within each group
     file_groups
         .into_iter()
         .flat_map(|(_, indices)| indices)
         .collect()
+}
+
+/// Find the first changed (non-Equal) line number within a change's body diff.
+/// Always returns old-side line numbers (for consistent scroll positioning).
+/// For Added/Deleted, returns the block start. For modifications, walks the
+/// body_diff to find the first Delete/Insert line.
+fn find_first_changed_line(change: &SemanticChange, block_start: usize) -> usize {
+    // For ADD/DEL, the whole block is the change
+    if matches!(change.kind, ChangeKind::Added | ChangeKind::Deleted) {
+        return block_start;
+    }
+
+    let Some(ref diff) = change.body_diff else {
+        return block_start;
+    };
+
+    let old_start = change
+        .old_symbol
+        .as_ref()
+        .map(|s| s.line_range.0)
+        .unwrap_or(block_start);
+
+    let mut old_line = old_start;
+
+    for dl in &diff.lines {
+        match dl.tag {
+            DiffLineTag::Equal => {
+                old_line += 1;
+            }
+            DiffLineTag::Delete | DiffLineTag::Insert => {
+                // Return old-side position for both delete and insert
+                return old_line;
+            }
+        }
+    }
+
+    block_start
 }

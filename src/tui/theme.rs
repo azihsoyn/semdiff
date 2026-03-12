@@ -49,6 +49,18 @@ pub fn normal_border_style() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
+/// Palette of distinct block colors shared by detail and summary panels
+pub const BLOCK_COLORS: &[Color] = &[
+    Color::Rgb(100, 140, 255), // Blue
+    Color::Rgb(210, 130, 210), // Magenta
+    Color::Rgb(80, 210, 200),  // Teal
+    Color::Rgb(210, 190, 80),  // Amber
+    Color::Rgb(80, 210, 120),  // Green
+    Color::Rgb(210, 150, 80),  // Orange
+    Color::Rgb(160, 120, 210), // Purple
+    Color::Rgb(210, 100, 100), // Rose
+];
+
 pub fn risk_style(level: &crate::llm::review::RiskLevel) -> Style {
     match level {
         crate::llm::review::RiskLevel::Low => Style::default().fg(Color::Green),

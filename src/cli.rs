@@ -66,6 +66,11 @@ pub enum Command {
         #[arg(long, default_value = "HEAD")]
         git_ref: String,
     },
+    /// Dump extracted symbols from a file (for debugging)
+    Symbols {
+        /// File to analyze
+        file: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, ValueEnum)]

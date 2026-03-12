@@ -23,17 +23,10 @@ struct BlockRegion {
     label: String,
 }
 
-/// Palette of distinct border/accent colors for blocks
-const BLOCK_COLORS: &[Color] = &[
-    Color::Rgb(100, 140, 255), // Blue
-    Color::Rgb(210, 130, 210), // Magenta
-    Color::Rgb(80, 210, 200),  // Teal
-    Color::Rgb(210, 190, 80),  // Amber
-    Color::Rgb(80, 210, 120),  // Green
-    Color::Rgb(210, 150, 80),  // Orange
-    Color::Rgb(160, 120, 210), // Purple
-    Color::Rgb(210, 100, 100), // Rose
-];
+use crate::tui::theme::BLOCK_COLORS;
+
+/// Map from 1-based line number to list of region indices (outermost first, innermost last)
+type RegionMap = std::collections::HashMap<usize, Vec<usize>>;
 
 /// Render side-by-side view inline (called from detail panel)
 pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
@@ -46,16 +39,21 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
     let old_file = change.old_symbol.as_ref().map(|s| s.file_path.clone());
     let new_file = change.new_symbol.as_ref().map(|s| s.file_path.clone());
 
+    // For DEL (no new_symbol) or ADD (no old_symbol), use the other side's path
+    // so both panels show the file for context
+    let display_old_file = old_file.clone().or_else(|| new_file.clone());
+    let display_new_file = new_file.clone().or_else(|| old_file.clone());
+
     let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
     let header_halves =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[0]);
 
-    let old_path_str = old_file
+    let old_path_str = display_old_file
         .as_ref()
         .map(|p| format!(" <- {}", p.display()))
         .unwrap_or_else(|| " <- (none)".to_string());
-    let new_path_str = new_file
+    let new_path_str = display_new_file
         .as_ref()
         .map(|p| format!(" -> {}", p.display()))
         .unwrap_or_else(|| " -> (none)".to_string());
@@ -82,11 +80,12 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
             .split(chunks[1]);
 
     // Load file content (requires &mut app) before borrowing changes
-    let old_content = old_file
+    // For DEL/ADD, load both sides using the available file path for context
+    let old_content = display_old_file
         .as_ref()
         .and_then(|p| app.load_old_file_content(p))
         .map(|s| s.to_string());
-    let new_content = new_file
+    let new_content = display_new_file
         .as_ref()
         .and_then(|p| app.load_file_content(p))
         .map(|s| s.to_string());
@@ -142,7 +141,13 @@ pub fn render_inline(f: &mut Frame, area: Rect, app: &mut App) {
     );
 
     // Phase 3: Scroll and display
-    let scroll_vline = find_scroll_vline(&old_vlines, scroll);
+    // detail_scroll is old-side based, so use old_vlines for scroll computation.
+    // Falls back to new_vlines for ADD changes (old side empty).
+    let scroll_vline = if old_text.is_empty() {
+        find_scroll_vline(&new_vlines, scroll)
+    } else {
+        find_scroll_vline(&old_vlines, scroll)
+    };
 
     let mut old_visible: Vec<Line> = Vec::with_capacity(visible_height);
     let mut new_visible: Vec<Line> = Vec::with_capacity(visible_height);
@@ -211,7 +216,7 @@ fn build_aligned_rows(old_text: &str, new_text: &str) -> Vec<AlignedRow> {
     rows
 }
 
-// === Phase 2: Render aligned rows with block borders ===
+// === Phase 2: Render aligned rows with nested block borders ===
 
 fn render_aligned_rows<'a>(
     rows: &[AlignedRow],
@@ -244,186 +249,254 @@ fn render_aligned_rows<'a>(
             AlignedRow::NewOnly { new_line } => (None, Some(*new_line)),
         };
 
-        // Emit top borders if this line starts a block
-        let old_needs_top = old_ln.and_then(|ln| {
-            old_region_map.get(&ln).and_then(|&ri| {
-                if old_regions[ri].start_line == ln && !old_top_emitted.contains(&ri) {
-                    Some(ri)
-                } else {
-                    None
-                }
-            })
-        });
-        let new_needs_top = new_ln.and_then(|ln| {
-            new_region_map.get(&ln).and_then(|&ri| {
-                if new_regions[ri].start_line == ln && !new_top_emitted.contains(&ri) {
-                    Some(ri)
-                } else {
-                    None
-                }
-            })
-        });
+        // Collect all regions that need top borders at this line
+        let old_starting = starting_regions(old_regions, &old_region_map, old_ln, &old_top_emitted);
+        let new_starting = starting_regions(new_regions, &new_region_map, new_ln, &new_top_emitted);
 
-        // Emit top borders
-        match (old_needs_top, new_needs_top) {
-            (Some(ori), Some(nri)) => {
-                let or = &old_regions[ori];
-                let nr = &new_regions[nri];
-                old_result.push(render_border_top(
-                    BLOCK_COLORS[or.color_idx], &or.label, border_width, or.is_selected,
-                ));
-                new_result.push(render_border_top(
-                    BLOCK_COLORS[nr.color_idx], &nr.label, border_width, nr.is_selected,
-                ));
-                old_top_emitted.insert(ori);
-                new_top_emitted.insert(nri);
-            }
-            (Some(ori), None) => {
-                let or = &old_regions[ori];
-                old_result.push(render_border_top(
-                    BLOCK_COLORS[or.color_idx], &or.label, border_width, or.is_selected,
-                ));
-                new_result.push(padding_line());
-                old_top_emitted.insert(ori);
-            }
-            (None, Some(nri)) => {
-                let nr = &new_regions[nri];
-                old_result.push(padding_line());
-                new_result.push(render_border_top(
-                    BLOCK_COLORS[nr.color_idx], &nr.label, border_width, nr.is_selected,
-                ));
-                new_top_emitted.insert(nri);
-            }
-            (None, None) => {}
+        // Emit top borders (may be multiple if nested blocks start at same line)
+        let max_tops = old_starting.len().max(new_starting.len());
+        for bi in 0..max_tops {
+            let old_border = if let Some(&ri) = old_starting.get(bi) {
+                let prefix = border_nesting_prefix(old_regions, &old_region_map, old_ln.unwrap(), ri);
+                let r = &old_regions[ri];
+                old_top_emitted.insert(ri);
+                render_border_top(prefix, BLOCK_COLORS[r.color_idx], &r.label, border_width, r.is_selected)
+            } else {
+                padding_line()
+            };
+            let new_border = if let Some(&ri) = new_starting.get(bi) {
+                let prefix = border_nesting_prefix(new_regions, &new_region_map, new_ln.unwrap(), ri);
+                let r = &new_regions[ri];
+                new_top_emitted.insert(ri);
+                render_border_top(prefix, BLOCK_COLORS[r.color_idx], &r.label, border_width, r.is_selected)
+            } else {
+                padding_line()
+            };
+            old_result.push(old_border);
+            new_result.push(new_border);
         }
 
         // Emit content
         match row {
             AlignedRow::Both { old_line, new_line } => {
+                let old_prefix = nesting_prefix(old_regions, &old_region_map, *old_line);
+                let new_prefix = nesting_prefix(new_regions, &new_region_map, *new_line);
                 let old_info = get_region_info(old_regions, &old_region_map, *old_line);
                 let new_info = get_region_info(new_regions, &new_region_map, *new_line);
                 let ot = old_file_lines.get(*old_line - 1).copied().unwrap_or("");
                 let nt = new_file_lines.get(*new_line - 1).copied().unwrap_or("");
-                old_result.push(render_content_line(*old_line, ot, old_info, h_scroll));
-                new_result.push(render_content_line(*new_line, nt, new_info, h_scroll));
+                // Use word-level diff when both sides are changed within a block
+                let both_changed = old_info
+                    .as_ref()
+                    .map_or(false, |i| i.is_changed)
+                    && new_info.as_ref().map_or(false, |i| i.is_changed);
+                if both_changed && ot != nt {
+                    let (old_spans, new_spans) = render_word_diff_line(
+                        *old_line,
+                        *new_line,
+                        ot,
+                        nt,
+                        old_info.as_ref().unwrap(),
+                        new_info.as_ref().unwrap(),
+                        old_prefix,
+                        new_prefix,
+                        h_scroll,
+                    );
+                    old_result.push(old_spans);
+                    new_result.push(new_spans);
+                } else {
+                    old_result.push(render_content_line(*old_line, ot, old_info, old_prefix, h_scroll));
+                    new_result.push(render_content_line(*new_line, nt, new_info, new_prefix, h_scroll));
+                }
             }
             AlignedRow::OldOnly { old_line } => {
+                let old_prefix = nesting_prefix(old_regions, &old_region_map, *old_line);
                 let old_info = get_region_info_as_changed(old_regions, &old_region_map, *old_line);
                 let ot = old_file_lines.get(*old_line - 1).copied().unwrap_or("");
-                old_result.push(render_content_line(*old_line, ot, old_info, h_scroll));
+                old_result.push(render_content_line(*old_line, ot, old_info, old_prefix, h_scroll));
                 new_result.push(padding_line());
             }
             AlignedRow::NewOnly { new_line } => {
+                let new_prefix = nesting_prefix(new_regions, &new_region_map, *new_line);
                 let new_info = get_region_info_as_changed(new_regions, &new_region_map, *new_line);
                 let nt = new_file_lines.get(*new_line - 1).copied().unwrap_or("");
                 old_result.push(padding_line());
-                new_result.push(render_content_line(*new_line, nt, new_info, h_scroll));
+                new_result.push(render_content_line(*new_line, nt, new_info, new_prefix, h_scroll));
             }
         }
 
-        // Emit bottom borders if this line ends a block
-        let old_needs_bottom = old_ln.and_then(|ln| {
-            old_region_map.get(&ln).and_then(|&ri| {
-                if old_regions[ri].end_line == ln && !old_bottom_emitted.contains(&ri) {
-                    Some(ri)
-                } else {
-                    None
-                }
-            })
-        });
-        let new_needs_bottom = new_ln.and_then(|ln| {
-            new_region_map.get(&ln).and_then(|&ri| {
-                if new_regions[ri].end_line == ln && !new_bottom_emitted.contains(&ri) {
-                    Some(ri)
-                } else {
-                    None
-                }
-            })
-        });
+        // Collect all regions that need bottom borders at this line (innermost first)
+        let old_ending = ending_regions(old_regions, &old_region_map, old_ln, &old_bottom_emitted);
+        let new_ending = ending_regions(new_regions, &new_region_map, new_ln, &new_bottom_emitted);
 
-        match (old_needs_bottom, new_needs_bottom) {
-            (Some(ori), Some(nri)) => {
-                let or = &old_regions[ori];
-                let nr = &new_regions[nri];
-                old_result.push(render_border_bottom(
-                    BLOCK_COLORS[or.color_idx], border_width, or.is_selected,
-                ));
-                new_result.push(render_border_bottom(
-                    BLOCK_COLORS[nr.color_idx], border_width, nr.is_selected,
-                ));
-                old_bottom_emitted.insert(ori);
-                new_bottom_emitted.insert(nri);
-            }
-            (Some(ori), None) => {
-                let or = &old_regions[ori];
-                old_result.push(render_border_bottom(
-                    BLOCK_COLORS[or.color_idx], border_width, or.is_selected,
-                ));
-                new_result.push(padding_line());
-                old_bottom_emitted.insert(ori);
-            }
-            (None, Some(nri)) => {
-                let nr = &new_regions[nri];
-                old_result.push(padding_line());
-                new_result.push(render_border_bottom(
-                    BLOCK_COLORS[nr.color_idx], border_width, nr.is_selected,
-                ));
-                new_bottom_emitted.insert(nri);
-            }
-            (None, None) => {}
+        let max_bottoms = old_ending.len().max(new_ending.len());
+        for bi in 0..max_bottoms {
+            let old_border = if let Some(&ri) = old_ending.get(bi) {
+                let prefix = border_nesting_prefix(old_regions, &old_region_map, old_ln.unwrap(), ri);
+                let r = &old_regions[ri];
+                old_bottom_emitted.insert(ri);
+                render_border_bottom(prefix, BLOCK_COLORS[r.color_idx], border_width, r.is_selected)
+            } else {
+                padding_line()
+            };
+            let new_border = if let Some(&ri) = new_ending.get(bi) {
+                let prefix = border_nesting_prefix(new_regions, &new_region_map, new_ln.unwrap(), ri);
+                let r = &new_regions[ri];
+                new_bottom_emitted.insert(ri);
+                render_border_bottom(prefix, BLOCK_COLORS[r.color_idx], border_width, r.is_selected)
+            } else {
+                padding_line()
+            };
+            old_result.push(old_border);
+            new_result.push(new_border);
         }
     }
 
     (old_result, new_result)
 }
 
+/// Collect region indices that start at the given line (outermost first)
+fn starting_regions(
+    regions: &[BlockRegion],
+    region_map: &RegionMap,
+    line_num: Option<usize>,
+    top_emitted: &HashSet<usize>,
+) -> Vec<usize> {
+    line_num.map_or(vec![], |ln| {
+        region_map.get(&ln).map_or(vec![], |stack| {
+            stack
+                .iter()
+                .filter(|&&ri| regions[ri].start_line == ln && !top_emitted.contains(&ri))
+                .copied()
+                .collect()
+        })
+    })
+}
+
+/// Collect region indices that end at the given line (innermost first)
+fn ending_regions(
+    regions: &[BlockRegion],
+    region_map: &RegionMap,
+    line_num: Option<usize>,
+    bottom_emitted: &HashSet<usize>,
+) -> Vec<usize> {
+    line_num.map_or(vec![], |ln| {
+        region_map.get(&ln).map_or(vec![], |stack| {
+            stack
+                .iter()
+                .rev() // innermost first
+                .filter(|&&ri| regions[ri].end_line == ln && !bottom_emitted.contains(&ri))
+                .copied()
+                .collect()
+        })
+    })
+}
+
 // === Block region building ===
 
-/// Map from 1-based line number to region index
-fn build_region_map(regions: &[BlockRegion]) -> std::collections::HashMap<usize, usize> {
-    let mut map = std::collections::HashMap::new();
+/// Build a map from 1-based line number to list of region indices.
+/// Each line's regions are sorted outermost (largest) first, innermost (smallest) last.
+fn build_region_map(regions: &[BlockRegion]) -> RegionMap {
+    let mut map: RegionMap = std::collections::HashMap::new();
     for (ri, r) in regions.iter().enumerate() {
         for line in r.start_line..=r.end_line {
-            // Only store the first region for a line (in case of overlap)
-            map.entry(line).or_insert(ri);
+            map.entry(line).or_default().push(ri);
         }
+    }
+    // Sort: largest region first (outermost), smallest last (innermost)
+    for v in map.values_mut() {
+        v.sort_by_key(|&ri| {
+            std::cmp::Reverse(regions[ri].end_line.saturating_sub(regions[ri].start_line))
+        });
     }
     map
 }
 
+/// Get region info for the innermost region at a line
 fn get_region_info(
     regions: &[BlockRegion],
-    region_map: &std::collections::HashMap<usize, usize>,
+    region_map: &RegionMap,
     line_num: usize,
 ) -> Option<ContentRegionInfo> {
-    if let Some(&ri) = region_map.get(&line_num) {
-        let r = &regions[ri];
-        Some(ContentRegionInfo {
-            color: BLOCK_COLORS[r.color_idx],
-            is_changed: r.changed_lines.contains(&line_num),
-            is_selected: r.is_selected,
+    region_map
+        .get(&line_num)
+        .and_then(|stack| stack.last())
+        .map(|&ri| {
+            let r = &regions[ri];
+            ContentRegionInfo {
+                color: BLOCK_COLORS[r.color_idx],
+                is_changed: r.changed_lines.contains(&line_num),
+                is_selected: r.is_selected,
+            }
         })
-    } else {
-        None
-    }
 }
 
 /// Like get_region_info but forces is_changed=true (for diff Delete/Insert lines)
 fn get_region_info_as_changed(
     regions: &[BlockRegion],
-    region_map: &std::collections::HashMap<usize, usize>,
+    region_map: &RegionMap,
     line_num: usize,
 ) -> Option<ContentRegionInfo> {
-    if let Some(&ri) = region_map.get(&line_num) {
-        let r = &regions[ri];
-        Some(ContentRegionInfo {
-            color: BLOCK_COLORS[r.color_idx],
-            is_changed: true,
-            is_selected: r.is_selected,
+    region_map
+        .get(&line_num)
+        .and_then(|stack| stack.last())
+        .map(|&ri| {
+            let r = &regions[ri];
+            ContentRegionInfo {
+                color: BLOCK_COLORS[r.color_idx],
+                is_changed: true,
+                is_selected: r.is_selected,
+            }
         })
-    } else {
-        None
+}
+
+/// Build nesting prefix spans for content lines: │ for each outer region (excluding innermost)
+fn nesting_prefix<'a>(
+    regions: &[BlockRegion],
+    region_map: &RegionMap,
+    line_num: usize,
+) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    if let Some(stack) = region_map.get(&line_num) {
+        // All regions except the last (innermost) contribute a │ border
+        for &ri in &stack[..stack.len().saturating_sub(1)] {
+            let r = &regions[ri];
+            let color = BLOCK_COLORS[r.color_idx];
+            let style = if r.is_selected {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            spans.push(Span::styled("│", style));
+        }
     }
+    spans
+}
+
+/// Build nesting prefix spans for a border line: │ for each region outermost to (but not including) border_ri
+fn border_nesting_prefix<'a>(
+    regions: &[BlockRegion],
+    region_map: &RegionMap,
+    line_num: usize,
+    border_ri: usize,
+) -> Vec<Span<'a>> {
+    let mut spans = Vec::new();
+    if let Some(stack) = region_map.get(&line_num) {
+        for &ri in stack {
+            if ri == border_ri {
+                break;
+            }
+            let r = &regions[ri];
+            let color = BLOCK_COLORS[r.color_idx];
+            let style = if r.is_selected {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            spans.push(Span::styled("│", style));
+        }
+    }
+    spans
 }
 
 fn build_block_regions(
@@ -608,12 +681,20 @@ fn find_scroll_vline(vlines: &[Line], file_line_scroll: usize) -> usize {
     vlines.len().saturating_sub(1)
 }
 
+/// A content line is one that is NOT a border line.
+/// Border lines contain ┌ or └ characters (box-drawing).
 fn is_content_vline(line: &Line) -> bool {
-    if line.spans.is_empty() { return false; }
-    let first = &line.spans[0].content;
-    if first.is_empty() { return false; }
-    let ch = first.chars().next().unwrap_or(' ');
-    ch != '┌' && ch != '└'
+    if line.spans.is_empty() {
+        return false;
+    }
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            if ch == '┌' || ch == '└' {
+                return false;
+            }
+        }
+    }
+    line.spans.iter().any(|s| !s.content.is_empty())
 }
 
 // === Line rendering ===
@@ -629,46 +710,66 @@ fn padding_line<'a>() -> Line<'a> {
     Line::from(Span::styled("", Style::default().bg(Color::Rgb(20, 20, 30))))
 }
 
-fn render_border_top<'a>(color: Color, label: &str, width: usize, is_selected: bool) -> Line<'a> {
+fn render_border_top<'a>(
+    prefix: Vec<Span<'a>>,
+    color: Color,
+    label: &str,
+    width: usize,
+    is_selected: bool,
+) -> Line<'a> {
     let style = if is_selected {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(color)
     };
-    let prefix = "┌─ ";
+    let prefix_len = prefix.len();
+    let adjusted_width = width.saturating_sub(prefix_len);
+    let pfx = "┌─ ";
     let suffix = " ─┐";
-    let max_label = width.saturating_sub(prefix.len() + suffix.len() + 1);
+    let max_label = adjusted_width.saturating_sub(pfx.len() + suffix.len() + 1);
     let label_trimmed: String = label.chars().take(max_label).collect();
-    let fill_len = width.saturating_sub(
-        prefix.chars().count() + label_trimmed.chars().count() + suffix.chars().count(),
+    let fill_len = adjusted_width.saturating_sub(
+        pfx.chars().count() + label_trimmed.chars().count() + suffix.chars().count(),
     );
     let fill: String = "─".repeat(fill_len);
-    Line::from(vec![Span::styled(
-        format!("{}{}{}{}", prefix, label_trimmed, fill, suffix),
+    let mut spans = prefix;
+    spans.push(Span::styled(
+        format!("{}{}{}{}", pfx, label_trimmed, fill, suffix),
         style,
-    )])
+    ));
+    Line::from(spans)
 }
 
-fn render_border_bottom<'a>(color: Color, width: usize, is_selected: bool) -> Line<'a> {
+fn render_border_bottom<'a>(
+    prefix: Vec<Span<'a>>,
+    color: Color,
+    width: usize,
+    is_selected: bool,
+) -> Line<'a> {
     let style = if is_selected {
         Style::default().fg(color).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(color)
     };
-    let fill_len = width.saturating_sub(2);
+    let prefix_len = prefix.len();
+    let adjusted_width = width.saturating_sub(prefix_len);
+    let fill_len = adjusted_width.saturating_sub(2);
     let fill: String = "─".repeat(fill_len);
-    Line::from(vec![Span::styled(format!("└{}┘", fill), style)])
+    let mut spans = prefix;
+    spans.push(Span::styled(format!("└{}┘", fill), style));
+    Line::from(spans)
 }
 
 fn render_content_line<'a>(
     line_num: usize,
     text: &str,
     region_info: Option<ContentRegionInfo>,
+    prefix: Vec<Span<'a>>,
     h_scroll: usize,
 ) -> Line<'a> {
     let expanded = expand_tabs(text);
     let display_text: String = expanded.chars().skip(h_scroll).collect();
-    let mut spans: Vec<Span<'a>> = Vec::new();
+    let mut spans: Vec<Span<'a>> = prefix;
 
     if let Some(info) = region_info {
         let border_style = if info.is_selected {
@@ -700,6 +801,120 @@ fn render_content_line<'a>(
             Style::default().fg(Color::DarkGray),
         ));
         spans.push(Span::styled(display_text, Style::default().fg(Color::Gray)));
+    }
+
+    Line::from(spans)
+}
+
+/// Render a pair of lines with word-level diff highlighting.
+/// Unchanged words get the block's normal style; changed words get bold + bg highlight.
+fn render_word_diff_line<'a>(
+    old_num: usize,
+    new_num: usize,
+    old_text: &str,
+    new_text: &str,
+    old_info: &ContentRegionInfo,
+    new_info: &ContentRegionInfo,
+    old_prefix: Vec<Span<'a>>,
+    new_prefix: Vec<Span<'a>>,
+    h_scroll: usize,
+) -> (Line<'a>, Line<'a>) {
+    use similar::{ChangeTag, TextDiff};
+
+    let old_expanded = expand_tabs(old_text);
+    let new_expanded = expand_tabs(new_text);
+
+    let diff = TextDiff::from_words(&old_expanded, &new_expanded);
+
+    // Collect old-side and new-side fragments
+    let mut old_frags: Vec<(String, bool)> = Vec::new(); // (text, is_changed)
+    let mut new_frags: Vec<(String, bool)> = Vec::new();
+
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                let t = change.value().to_string();
+                old_frags.push((t.clone(), false));
+                new_frags.push((t, false));
+            }
+            ChangeTag::Delete => {
+                old_frags.push((change.value().to_string(), true));
+            }
+            ChangeTag::Insert => {
+                new_frags.push((change.value().to_string(), true));
+            }
+        }
+    }
+
+    let old_line = build_word_diff_spans(old_num, &old_frags, old_info, old_prefix, h_scroll);
+    let new_line = build_word_diff_spans(new_num, &new_frags, new_info, new_prefix, h_scroll);
+    (old_line, new_line)
+}
+
+fn build_word_diff_spans<'a>(
+    line_num: usize,
+    frags: &[(String, bool)],
+    info: &ContentRegionInfo,
+    prefix: Vec<Span<'a>>,
+    h_scroll: usize,
+) -> Line<'a> {
+    let border_style = if info.is_selected {
+        Style::default()
+            .fg(info.color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(info.color)
+    };
+    let unchanged_style = Style::default().fg(Color::Rgb(180, 180, 180));
+    let changed_style = Style::default()
+        .fg(Color::White)
+        .bg(color_to_bg(info.color))
+        .add_modifier(Modifier::BOLD);
+    let num_style = Style::default()
+        .fg(info.color)
+        .add_modifier(Modifier::BOLD);
+
+    // Flatten all fragments into a single string, then apply h_scroll
+    let full_text: String = frags.iter().map(|(t, _)| t.as_str()).collect();
+    let scrolled: String = full_text.chars().skip(h_scroll).collect();
+
+    // Map character positions to changed/unchanged
+    let mut char_changed: Vec<bool> = Vec::new();
+    for (text, is_changed) in frags {
+        for _ in text.chars() {
+            char_changed.push(*is_changed);
+        }
+    }
+    // Skip h_scroll chars
+    let char_changed: Vec<bool> = char_changed.into_iter().skip(h_scroll).collect();
+
+    // Build spans with nesting prefix
+    let mut spans: Vec<Span<'a>> = prefix;
+    spans.push(Span::styled("│", border_style));
+    spans.push(Span::styled(format!("{:4} ", line_num), num_style));
+
+    let chars: Vec<char> = scrolled.chars().collect();
+    if chars.is_empty() {
+        return Line::from(spans);
+    }
+
+    let mut i = 0;
+    while i < chars.len() {
+        let is_changed = char_changed.get(i).copied().unwrap_or(false);
+        let mut j = i + 1;
+        while j < chars.len()
+            && char_changed.get(j).copied().unwrap_or(false) == is_changed
+        {
+            j += 1;
+        }
+        let segment: String = chars[i..j].iter().collect();
+        let style = if is_changed {
+            changed_style
+        } else {
+            unchanged_style
+        };
+        spans.push(Span::styled(segment, style));
+        i = j;
     }
 
     Line::from(spans)

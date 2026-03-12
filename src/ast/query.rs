@@ -550,7 +550,11 @@ fn extract_ts_node(
             return; // don't recurse into function body for top-level extraction
         }
         "export_statement" => {
-            // Recurse into exported declarations
+            // Check if this is `export default <expr>` — extract as a symbol
+            if let Some(sym) = extract_ts_export_default(node, source, path) {
+                symbols.push(sym);
+            }
+            // Always recurse into exported declarations (including inside default exports)
             for i in 0..node.child_count() {
                 if let Some(child) = node.child(i) {
                     extract_ts_node(child, source, path, parent, symbols);
@@ -866,6 +870,59 @@ fn extract_ts_parameters(node: Node, source: &[u8]) -> Vec<Parameter> {
         }
     }
     params
+}
+
+/// Extract `export default <expr>` as a symbol named "default".
+/// This handles patterns like `export default { ... } satisfies Type`
+/// or `export default function() { ... }` that aren't otherwise captured.
+fn extract_ts_export_default(node: Node, source: &[u8], path: &Path) -> Option<Symbol> {
+    // Check if this export_statement has a "default" keyword
+    let mut has_default = false;
+    let mut has_declaration = false;
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i) {
+            if child.kind() == "default" || node_text(child, source) == "default" {
+                has_default = true;
+            }
+            // If it contains a named declaration, let the normal recursion handle it
+            if matches!(
+                child.kind(),
+                "function_declaration"
+                    | "class_declaration"
+                    | "lexical_declaration"
+                    | "interface_declaration"
+                    | "type_alias_declaration"
+                    | "enum_declaration"
+            ) {
+                has_declaration = true;
+            }
+        }
+    }
+
+    if !has_default || has_declaration {
+        return None;
+    }
+
+    // This is `export default <expr>` — extract the whole thing as a symbol
+    let body_text = node_text(node, source);
+    let normalized = normalize_body(&body_text);
+    let body_hash = blake3::hash(normalized.as_bytes()).into();
+
+    Some(Symbol {
+        kind: SymbolKind::Constant,
+        name: "default".to_string(),
+        qualified_name: "default".to_string(),
+        file_path: path.to_path_buf(),
+        line_range: (node.start_position().row + 1, node.end_position().row + 1),
+        signature: String::new(),
+        body_hash,
+        body_text,
+        normalized_body: normalized,
+        parent: None,
+        visibility: Visibility::Public,
+        parameters: Vec::new(),
+        return_type: None,
+    })
 }
 
 fn detect_ts_export(node: Node, _source: &[u8]) -> Visibility {

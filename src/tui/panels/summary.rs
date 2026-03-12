@@ -6,6 +6,7 @@ use ratatui::{
     Frame,
 };
 
+use crate::diff::change::SemanticChange;
 use crate::tui::app::{App, PanelFocus};
 use crate::tui::theme;
 
@@ -79,6 +80,19 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
         }
     }
 
+    // Sort changes within each file by line number (top of file first)
+    for (_, indices) in &mut file_groups {
+        indices.sort_by_key(|&i| {
+            let change = &app.diff_result.changes[i];
+            change
+                .new_symbol
+                .as_ref()
+                .or(change.old_symbol.as_ref())
+                .map(|s| s.line_range.0)
+                .unwrap_or(0)
+        });
+    }
+
     for (file, change_indices) in &file_groups {
         // File header
         let short_file = shorten_path(file);
@@ -91,12 +105,16 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
         // File headers are not selectable — use None
         index_map.push(None);
 
-        // Change items under this file
-        for &ci in change_indices {
+        // Compute nesting depth for indentation
+        let nesting = compute_nesting(change_indices, &app.diff_result.changes);
+
+        // Change items under this file (with block colors matching detail panel)
+        for (color_counter, &ci) in change_indices.iter().enumerate() {
             let change = &app.diff_result.changes[ci];
             let kind_style = theme::change_kind_style(&change.kind);
             let label = change.kind.label();
             let name = change.symbol_name();
+            let block_color = theme::BLOCK_COLORS[color_counter % theme::BLOCK_COLORS.len()];
 
             let confidence = if change.confidence < 1.0 {
                 format!(" {:.0}%", change.confidence * 100.0)
@@ -104,18 +122,22 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
                 String::new()
             };
 
+            let name_style = if ci == app.selected_index {
+                Style::default()
+                    .fg(block_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(block_color)
+            };
+
+            let depth = nesting[color_counter];
+            let indent = "  ".repeat(depth + 1);
+
             let line = Line::from(vec![
-                Span::raw("  "),
+                Span::raw(indent),
                 Span::styled(format!("[{}]", label), kind_style),
                 Span::raw(" "),
-                Span::styled(
-                    name.to_string(),
-                    if ci == app.selected_index {
-                        Style::default().add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    },
-                ),
+                Span::styled(name.to_string(), name_style),
                 Span::styled(
                     confidence,
                     Style::default().fg(ratatui::style::Color::DarkGray),
@@ -144,4 +166,35 @@ fn shorten_path(path: &str) -> &str {
             .sum::<usize>()
         + 1;
     &path[start..]
+}
+
+/// Compute nesting depth for each change within a file group.
+/// A symbol is nested if its line range is contained within a preceding symbol's range.
+fn compute_nesting(indices: &[usize], changes: &[SemanticChange]) -> Vec<usize> {
+    let mut depths = vec![0usize; indices.len()];
+    // Stack of (end_line, depth)
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+
+    for (pos, &ci) in indices.iter().enumerate() {
+        let change = &changes[ci];
+        let sym = change.new_symbol.as_ref().or(change.old_symbol.as_ref());
+        if let Some(sym) = sym {
+            // Pop stack entries whose ranges have ended before this symbol starts
+            while let Some(&(end, _)) = stack.last() {
+                if sym.line_range.0 > end {
+                    stack.pop();
+                } else {
+                    break;
+                }
+            }
+
+            let depth = stack.last().map_or(0, |&(_, d)| d + 1);
+            depths[pos] = depth;
+
+            // Push this symbol's range onto the stack
+            stack.push((sym.line_range.1, depth));
+        }
+    }
+
+    depths
 }

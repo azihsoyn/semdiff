@@ -50,7 +50,12 @@ pub fn print_diff(result: &DiffResult) {
                 String::new()
             };
 
-            println!("  [{}] {}{}", change.kind.label(), name, confidence);
+            let intent_tag = change
+                .intent
+                .as_ref()
+                .map(|i| format!(" <{}>", i.primary.label()))
+                .unwrap_or_default();
+            println!("  [{}] {}{}{}", change.kind.label(), name, confidence, intent_tag);
             if !desc.is_empty() {
                 println!("       {}", desc);
             }

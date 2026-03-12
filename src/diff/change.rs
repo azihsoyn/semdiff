@@ -1,5 +1,6 @@
 use crate::ast::symbol::{Parameter, Symbol, Visibility};
 use crate::diff::body_diff::BodyDiff;
+use crate::diff::intent::IntentClassification;
 use serde::Serialize;
 use std::path::PathBuf;
 
@@ -126,6 +127,8 @@ pub struct SemanticChange {
     pub confidence: f64,
     pub body_diff: Option<BodyDiff>,
     pub related_changes: Vec<usize>,
+    /// Inferred developer intent behind this change
+    pub intent: Option<IntentClassification>,
 }
 
 impl SemanticChange {

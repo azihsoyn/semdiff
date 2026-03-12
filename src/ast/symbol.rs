@@ -120,9 +120,11 @@ impl Symbol {
             return 0.0;
         }
 
-        // Cap comparison at 1000 chars for performance
+        // Cap comparison at ~1000 bytes for performance (respecting UTF-8 boundaries)
         let (a_cmp, b_cmp) = if max_len > 1000 {
-            (&a[..a.len().min(1000)], &b[..b.len().min(1000)])
+            let a_end = floor_char_boundary(a, a.len().min(1000));
+            let b_end = floor_char_boundary(b, b.len().min(1000));
+            (&a[..a_end], &b[..b_end])
         } else {
             (a.as_str(), b.as_str())
         };
@@ -356,6 +358,18 @@ fn collect_ast_trail(node: tree_sitter::Node, source: &[u8], depth: u16, trail: 
             }
         }
     }
+}
+
+/// Find the largest byte index <= `i` that is a valid UTF-8 char boundary.
+fn floor_char_boundary(s: &str, i: usize) -> usize {
+    if i >= s.len() {
+        return s.len();
+    }
+    let mut pos = i;
+    while pos > 0 && !s.is_char_boundary(pos) {
+        pos -= 1;
+    }
+    pos
 }
 
 /// Normalize source body for comparison

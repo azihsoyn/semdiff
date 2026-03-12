@@ -2,6 +2,7 @@ pub mod body_diff;
 pub mod change;
 pub mod classifier;
 pub mod cross_file;
+pub mod intent;
 pub mod matcher;
 
 use anyhow::Result;
@@ -308,6 +309,7 @@ fn run_diff_pipeline(
                 confidence,
                 body_diff: body_d,
                 related_changes: Vec::new(),
+                intent: None,
             });
             change_id += 1;
         }
@@ -387,6 +389,7 @@ fn run_diff_pipeline(
             confidence: m.confidence,
             body_diff: cross_body_diffs[mi].clone(),
             related_changes: Vec::new(),
+            intent: None,
         });
         change_id += 1;
 
@@ -404,6 +407,7 @@ fn run_diff_pipeline(
                 confidence: 1.0,
                 body_diff: None,
                 related_changes: Vec::new(),
+                intent: None,
             });
             change_id += 1;
         }
@@ -419,12 +423,19 @@ fn run_diff_pipeline(
                 confidence: 1.0,
                 body_diff: None,
                 related_changes: Vec::new(),
+                intent: None,
             });
             change_id += 1;
         }
     }
 
     link_related_changes(&mut changes);
+
+    // Classify developer intent for each change
+    for i in 0..changes.len() {
+        let classification = intent::classify_intent(&changes[i]);
+        changes[i].intent = Some(classification);
+    }
 
     let summary = DiffSummary::from_changes(&changes);
 

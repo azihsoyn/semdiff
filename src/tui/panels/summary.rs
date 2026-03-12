@@ -143,6 +143,12 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
             let depth = nesting[color_counter];
             let indent = "  ".repeat(depth + 1);
 
+            let intent_tag = change
+                .intent
+                .as_ref()
+                .map(|i| format!(" {}", i.primary.icon()))
+                .unwrap_or_default();
+
             let line = Line::from(vec![
                 Span::raw(indent),
                 Span::styled(format!("[{}]", label), kind_style),
@@ -151,6 +157,10 @@ fn build_grouped_items(app: &App) -> (Vec<ListItem<'static>>, Vec<Option<usize>>
                 Span::styled(
                     confidence,
                     Style::default().fg(ratatui::style::Color::DarkGray),
+                ),
+                Span::styled(
+                    intent_tag,
+                    Style::default().fg(ratatui::style::Color::Yellow),
                 ),
             ]);
 

@@ -929,8 +929,26 @@ fn compute_changed_lines(change: &SemanticChange) -> (HashSet<usize>, HashSet<us
         return (old_changed, new_changed);
     };
 
-    let old_start = change.old_symbol.as_ref().map(|s| s.line_range.0).unwrap_or(1);
-    let new_start = change.new_symbol.as_ref().map(|s| s.line_range.0).unwrap_or(1);
+    // body_text starts at the AST node's actual start, which may differ from
+    // line_range.0 when start_line_with_comment() extends the range to include
+    // a preceding JSDoc/block comment. Compute the real start from the end line
+    // and body line count.
+    let old_start = change
+        .old_symbol
+        .as_ref()
+        .map(|s| {
+            let body_lines = s.body_text.lines().count().max(1);
+            s.line_range.1 + 1 - body_lines
+        })
+        .unwrap_or(1);
+    let new_start = change
+        .new_symbol
+        .as_ref()
+        .map(|s| {
+            let body_lines = s.body_text.lines().count().max(1);
+            s.line_range.1 + 1 - body_lines
+        })
+        .unwrap_or(1);
     let mut old_line = old_start;
     let mut new_line = new_start;
 

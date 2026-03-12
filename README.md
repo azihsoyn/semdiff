@@ -1,95 +1,95 @@
 # semdiff
 
-構造理解ベースのセマンティック diff ツール。
-AST レベルでコードを解析し、**ファイルを跨いだコード移動検出**・**変更分類**・**リポジトリ全体の影響分析**を行う。
+Structure-aware semantic diff tool.
+Parses code at the AST level and performs **cross-file move detection**, **change classification**, and **repository-wide impact analysis**.
 
-通常の line diff では追いにくい LLM 生成コードや大規模リファクタリングのレビューを支援する。
+Designed to help review LLM-generated code and large-scale refactoring that are hard to follow with traditional line-based diffs.
 
-## 特徴
+## Features
 
-- **AST ベースの構造 diff** — tree-sitter による構文解析。行単位ではなくシンボル（関数・構造体・enum 等）単位で比較
-- **変更の自動分類** — Added / Deleted / Renamed / Moved / Extracted / Inlined / SignatureChanged / BodyChanged / VisibilityChanged
-- **ファイル間移動検出** — body hash 完全一致 → 名前+body 類似度 → body 類似度 → 抽出/インライン検出の 5 フェーズアルゴリズム
-- **Repo-aware 影響分析** — コールグラフ構築 + 類似コード検出 + パターン警告。変更の波及範囲を可視化
-- **Git ネイティブ** — デフォルトで git diff として動作。引数なしで直前コミットとの diff
-- **TUI** — ratatui ベースの対話的ビューア。サマリ一覧・詳細 diff・影響分析を一画面で閲覧
-- **LLM レビュー支援** — diff エンジンは LLM 非依存。構造化された変更データを入力として LLM にレビュー補助を依頼可能
+- **AST-based structural diff** — Parses source using tree-sitter. Compares at the symbol level (functions, structs, enums, etc.) rather than lines
+- **Automatic change classification** — Added / Deleted / Renamed / Moved / Extracted / Inlined / SignatureChanged / BodyChanged / VisibilityChanged
+- **Cross-file move detection** — 5-phase algorithm: body hash exact match → name+body similarity → body similarity → extract detection → inline detection
+- **Repo-aware impact analysis** — Call graph construction + similar code detection + pattern warnings. Visualizes the blast radius of changes
+- **Git native** — Works as a git diff by default. No arguments = diff against the last commit
+- **TUI** — Interactive viewer built with ratatui. Summary list, side-by-side diff, and impact analysis in a single screen
+- **LLM review support** — The diff engine is LLM-independent. Structured change data can be fed to an LLM for review assistance
 
-## ビルド
+## Build
 
 ```bash
-# 必要なもの: Rust toolchain (1.70+)
-# https://rustup.rs/ でインストール
+# Requirements: Rust toolchain (1.70+)
+# Install from https://rustup.rs/
 
-git clone <this-repo>
+git clone https://github.com/azihsoyn/semdiff.git
 cd semdiff
 cargo build --release
 
-# バイナリは target/release/semdiff に生成される
+# Binary is generated at target/release/semdiff
 ```
 
-## 使い方
+## Usage
 
-基本は **git diff** として動作する。引数は git の range 指定。
+By default, semdiff operates as a **git diff**. Arguments follow git range syntax.
 
-### 基本（Git モード）
+### Basic (Git mode)
 
 ```bash
-# 引数なし: HEAD との diff（直前コミットからの変更）
+# No arguments: diff against HEAD (changes since last commit)
 semdiff
 
-# 直近 N コミット
+# Last N commits
 semdiff HEAD~3
 
-# ブランチ間の diff
+# Between branches
 semdiff main..feature-branch
 
-# 特定コミット間
+# Between specific commits
 semdiff abc123..def456
 
-# テキスト出力
+# Text output
 semdiff HEAD -o text
 
-# JSON 出力
+# JSON output
 semdiff main..feature -o json
 ```
 
-### Repo-aware 影響分析
+### Repo-aware impact analysis
 
 ```bash
-# 影響分析付き（推奨）
+# With impact analysis (recommended)
 semdiff main..feature --repo-analysis
 
-# 影響分析の深度を指定（デフォルト: 2）
+# Specify impact depth (default: 2)
 semdiff HEAD --repo-analysis --impact-depth 3
 ```
 
-影響分析ではリポジトリ全体を走査し、以下を検出する:
+Impact analysis scans the entire repository and detects:
 
-- **Affected Callers** — 変更された関数を呼び出している箇所（間接呼び出しも追跡）
-- **Similar Code** — リポジトリ内の類似コード（更新漏れの可能性）
-- **Pattern Warnings** — 名前パターンが似ている関数が片方だけ変更されている場合の警告
+- **Affected Callers** — Call sites of changed functions (transitive callers are also tracked)
+- **Similar Code** — Similar code in the repository (potential missed updates)
+- **Pattern Warnings** — Warnings when functions with similar naming patterns are only partially updated
 
-### インデックス（事前コンパイル）
+### Index (pre-compilation)
 
-巨大リポジトリでの `--repo-analysis` を高速化するため、シンボル DB・コールグラフ・類似度インデックスを事前に構築できる。
+To speed up `--repo-analysis` on large repositories, you can pre-build the symbol DB, call graph, and similarity index.
 
 ```bash
-# HEAD でインデックス構築（.semdiff/ ディレクトリに保存）
+# Build index at HEAD (saved to .semdiff/ directory)
 semdiff index
 
-# 特定 ref でインデックス構築
+# Build index at a specific ref
 semdiff index --ref develop
 
-# 以降は --repo-analysis 時にインデックスが自動的に使われる
-semdiff HEAD~3 --repo-analysis    # キャッシュヒット時 ~2秒
+# The index is automatically used during --repo-analysis
+semdiff HEAD~3 --repo-analysis    # ~2s with cache hit
 ```
 
-インデックスにはシンボル情報・コールリファレンス・MinHash シグネチャが含まれ、`--repo-analysis` 実行時に自動的にロードされる。コミットハッシュが一致しない場合は自動的にフルスキャンにフォールバックする。
+The index contains symbol information, call references, and MinHash signatures. It is automatically loaded during `--repo-analysis`. If the commit hash doesn't match, it falls back to a full scan.
 
-### ディレクトリ / ファイル比較（オプション）
+### Directory / file comparison
 
-git リポジトリ外や任意のディレクトリ同士を比較したい場合:
+To compare directories or files outside a git repository:
 
 ```bash
 semdiff --dirs old_dir/ new_dir/
@@ -97,7 +97,7 @@ semdiff --dirs old.rs new.rs -o text
 semdiff --dirs old/ new/ --repo-analysis
 ```
 
-### LLM レビュー
+### LLM review
 
 ```bash
 # Anthropic API
@@ -106,36 +106,36 @@ semdiff HEAD --llm-review --api-key $ANTHROPIC_API_KEY
 # OpenAI API
 semdiff HEAD --llm-review --llm-provider openai --api-key $OPENAI_API_KEY
 
-# 環境変数でも設定可能
+# Can also be set via environment variable
 export SEMDIFF_API_KEY=sk-...
 semdiff HEAD --llm-review
 ```
 
-LLM にはアルゴリズムで抽出した構造化変更データ（ChangeKind, シンボル情報, body diff）を送信する。raw diff 全体を投げるのではなく、コンパクトで焦点の絞られた入力を使用する。
+The LLM receives structured change data (ChangeKind, symbol info, body diff) extracted by the algorithm — not the raw diff, but compact, focused input.
 
-## TUI 操作
+## TUI controls
 
 ```
-キー         操作
+Key          Action
 ─────────────────────────────
-q            終了
-Tab          パネル切替（Summary → Detail → Impact/Review）
-j / k        上下移動 / スクロール
-PgUp / PgDn  10行スクロール
-Home / End   先頭 / 末尾
-t            Detail タブ切替（Diff → Old Source → New Source）
-v            下部パネル表示/非表示
-b            下部パネル切替（Impact ↔ Review）
+q            Quit
+Tab          Cycle focus (Summary → Detail → Impact/Review)
+j / k        Navigate / scroll
+h / l        Horizontal scroll (Detail panel)
+PgUp / PgDn  Scroll 10 lines
+Home / End   Jump to first / last
+v            Toggle bottom panel
+b            Switch bottom panel (Impact ↔ Review)
 ```
 
 ```
 ┌──────────────────┬──────────────────────────────┐
-│ Summary          │ Detail                       │
-│ [MOV] process()  │ Old: main.rs:1-10            │
-│ [SIG] transform()│ New: core.rs:1-10            │
-│ [MOD] validate() │                              │
-│ [ADD] new_func() │ -fn process(x: i32) {        │
-│ [DEL] old_func() │ +fn process(x: i32, y: i32) {│
+│ Summary          │ Detail (side-by-side)        │
+│ [MOV] process()  │ Old: main.rs      New: core.rs│
+│ [SIG] transform()│                              │
+│ [MOD] validate() │ -fn process(x: i32) {        │
+│ [ADD] new_func() │ +fn process(x: i32, y: i32) {│
+│ [DEL] old_func() │                              │
 ├──────────────────┴──────────────────────────────┤
 │ Impact                                          │
 │ Affected Callers (3)                             │
@@ -145,81 +145,41 @@ b            下部パネル切替（Impact ↔ Review）
 └─────────────────────────────────────────────────┘
 ```
 
-## 対応言語
+## Supported languages
 
-| 言語         | 関数 | 構造体/型 | メソッド | 定数 | コールグラフ |
-|-------------|------|-----------|----------|------|------------|
-| Rust        | o    | o         | o        | o    | o          |
-| Go          | o    | o         | o        | o    | o          |
-| TypeScript  | o    | o         | o        | o    | o          |
-| TSX         | o    | o         | o        | o    | o          |
-| JavaScript  | o    | o         | o        | o    | o          |
-| Python      | o    | o         | -        | -    | o          |
-| Svelte      | o    | o         | o        | o    | o          |
+| Language    | Functions | Structs/Types | Methods | Constants | Call graph |
+|-------------|-----------|---------------|---------|-----------|------------|
+| Rust        | yes       | yes           | yes     | yes       | yes        |
+| Go          | yes       | yes           | yes     | yes       | yes        |
+| TypeScript  | yes       | yes           | yes     | yes       | yes        |
+| TSX         | yes       | yes           | yes     | yes       | yes        |
+| JavaScript  | yes       | yes           | yes     | yes       | yes        |
+| Python      | yes       | yes           | -       | -         | yes        |
+| Svelte      | yes       | yes           | yes     | yes       | yes        |
 
-Svelte は `<script>` ブロックを自動抽出して TypeScript/TSX として解析する。
+Svelte files: the `<script>` block is automatically extracted and parsed as TypeScript/TSX.
 
-## アーキテクチャ
+## Design principles
 
-```
-src/
-├── main.rs           CLI エントリポイント
-├── cli.rs            clap 引数定義
-├── git.rs            Git 統合（git コマンド経由）
-├── ast/
-│   ├── language.rs   言語検出・tree-sitter grammar
-│   ├── parser.rs     ソースコード → AST
-│   ├── query.rs      AST → Symbol 抽出（Rust/Go/TS/JS/Python）
-│   ├── symbol.rs     Symbol 型・類似度計算・body 正規化
-│   └── call_refs.rs  関数呼び出し参照の抽出
-├── diff/
-│   ├── mod.rs        diff オーケストレータ（Git / ディレクトリ両対応）
-│   ├── change.rs     ChangeKind, SemanticChange, DiffResult
-│   ├── matcher.rs    同一ファイル内シンボルマッチング
-│   ├── classifier.rs マッチペアの変更種別分類
-│   ├── cross_file.rs ファイル間移動検出（5 フェーズ）
-│   └── body_diff.rs  関数本体の行レベル diff
-├── repo/
-│   ├── mod.rs        リポジトリ全体分析オーケストレータ
-│   ├── call_graph.rs コールグラフ構築・クエリ
-│   ├── similarity.rs shingle ベースの類似コード検出
-│   └── impact.rs     影響分析（コールグラフ + 類似度 → リスク評価）
-├── index.rs          事前コンパイル（シンボル DB / コールグラフ / MinHash）
-├── tui/
-│   ├── mod.rs        イベントループ・レイアウト
-│   ├── app.rs        アプリ状態
-│   ├── theme.rs      色・スタイル
-│   └── panels/       Summary / Detail / Review / Impact パネル
-├── llm/
-│   ├── client.rs     Anthropic/OpenAI API クライアント
-│   ├── prompt.rs     構造化変更データ → プロンプト生成
-│   └── review.rs     ReviewResult 型
-└── output/
-    ├── text.rs       テキスト出力
-    └── json.rs       JSON 出力
-```
+1. **Diff engine is LLM-independent** — AST parsing, similarity detection, move detection, and classification are all algorithmic
+2. **LLM is for review assistance only** — Uses structured change units extracted by the algorithm as input
+3. **Structure-based comparison** — Aims for human-readable diffs rather than minimum edit distance
 
-### 設計原則
+## Cross-file move detection algorithm
 
-1. **diff エンジンは LLM 非依存** — AST 解析、類似判定、move detection、classification は全てアルゴリズムで完結
-2. **LLM はレビュー補助のみ** — アルゴリズムで抽出した構造化 change unit を入力として活用
-3. **構造ベースの比較** — 最小編集距離ではなく、人間が理解しやすい diff を目指す
+1. **Exact body hash match** — O(1) detection using blake3 hash. Confidence: 95%
+2. **Name + body similarity** — Compares body similarity of same-named symbols. Confidence: similarity × 0.9
+3. **Body similarity only** — Candidates with ≥70% body similarity even if names differ. Confidence: similarity × 0.85
+4. **Extract detection** — Checks if a new symbol's body is a substring of an old symbol
+5. **Inline detection** — Checks if a deleted symbol's body is contained within a new symbol
 
-### ファイル間移動検出アルゴリズム
+## Repo-aware impact analysis
 
-1. **Exact body hash match** — blake3 ハッシュで O(1) 完全一致検出。信頼度 95%
-2. **Name + body similarity** — 同名シンボルの body 類似度比較。信頼度 = 類似度 × 0.9
-3. **Body similarity only** — 名前が異なっても body が 70% 以上類似なら候補。信頼度 = 類似度 × 0.85
-4. **Extract detection** — 新シンボルの body が旧シンボルの部分文字列かチェック
-5. **Inline detection** — 削除シンボルの body が新シンボルに含まれるかチェック
+- **Call graph**: Traverses `call_expression` nodes via tree-sitter. Extracts call relationships from all source files and builds forward/reverse indexes
+- **Similar code detection**: Fast repository-wide scan using Jaccard similarity of 4-gram shingles. Approximate Jaccard via MinHash for O(k) fast filtering. FNV hashing for shingle computation scales to large repositories
+- **Pre-built index**: `semdiff index` saves symbol DB, call graph, and MinHash signatures to `.semdiff/`. Uses `git cat-file --batch` for fast batch loading
+- **Risk assessment**: Signature change + has callers → High, body change + has callers → Medium, similar code not updated → Warning
 
-### Repo-aware 影響分析
-
-- **コールグラフ**: tree-sitter で `call_expression` ノードを走査。全ソースファイルから呼び出し関係を抽出し、順方向・逆方向インデックスを構築
-- **類似コード検出**: 4-gram shingle の Jaccard 類似度で高速にリポジトリ全体を走査。MinHash による近似 Jaccard で O(k) 高速フィルタリング。FNV ハッシュによるシングル化で大規模リポジトリにも対応
-- **事前インデックス**: `semdiff index` でシンボル DB・コールグラフ・MinHash シグネチャを `.semdiff/` に保存。`git cat-file --batch` によるバッチ読み込みで高速化
-- **リスク評価**: シグネチャ変更 + 呼び出し元あり → High、body 変更 + 呼び出し元あり → Medium、類似コードの更新漏れ → Warning
-
-## ライセンス
+## License
 
 MIT

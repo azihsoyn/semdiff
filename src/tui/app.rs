@@ -145,10 +145,57 @@ impl App {
 
     pub fn scroll_detail_down(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_add(1);
+        self.sync_selection_from_scroll();
     }
 
     pub fn scroll_detail_up(&mut self) {
         self.detail_scroll = self.detail_scroll.saturating_sub(1);
+        self.sync_selection_from_scroll();
+    }
+
+    /// When scrolling in the detail panel, if the viewport enters a different
+    /// block's line range, auto-select that block in the summary panel.
+    fn sync_selection_from_scroll(&mut self) {
+        // Determine the file currently being viewed (from new_symbol, or old_symbol)
+        let current_file = self
+            .selected_change()
+            .and_then(|c| {
+                c.new_symbol
+                    .as_ref()
+                    .or(c.old_symbol.as_ref())
+                    .map(|s| s.file_path.clone())
+            });
+        let Some(current_file) = current_file else {
+            return;
+        };
+
+        // Use a line a few rows into the visible area as the "probe" line
+        let probe_line = self.detail_scroll + 5;
+
+        // Find which change's line range contains the probe line
+        for (i, change) in self.diff_result.changes.iter().enumerate() {
+            if i == self.selected_index {
+                continue;
+            }
+            // Check new_symbol first (primary for the new side), then old_symbol
+            let sym = change
+                .new_symbol
+                .as_ref()
+                .or(change.old_symbol.as_ref());
+            if let Some(sym) = sym {
+                if sym.file_path == current_file
+                    && probe_line >= sym.line_range.0
+                    && probe_line <= sym.line_range.1
+                {
+                    self.selected_index = i;
+                    if let Some(pos) = self.nav_order.iter().position(|&idx| idx == i) {
+                        self.nav_pos = pos;
+                    }
+                    self.bottom_scroll = 0;
+                    return;
+                }
+            }
+        }
     }
 
     pub fn scroll_detail_right(&mut self) {
